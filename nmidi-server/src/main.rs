@@ -116,6 +116,7 @@ async fn main() -> Result<()> {
             let session_manager = match session::SessionManager::new(
                 service_name.clone(),
                 args.bind.clone(),
+                port.clone(),
             )
             .await
             {
