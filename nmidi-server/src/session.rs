@@ -183,8 +183,8 @@ impl SessionManager {
         Ok(tokio::spawn(async move {
             let mut sequence = 0u16;
             
-            while let Some((midir_timestamp, midi_data)) = input_rx.recv().await {
-                debug!("Received MIDI input: {:?} at midir timestamp {}", midi_data, midir_timestamp);
+            while let Some((first_midir_timestamp, first_midi_data)) = input_rx.recv().await {
+                debug!("Received MIDI input: {:?} at midir timestamp {}", first_midi_data, first_midir_timestamp);
                 
                 // Get all connected peers
                 let peers: Vec<SocketAddr> = {
@@ -204,7 +204,42 @@ impl SessionManager {
                 
                 // Create RTP packet with MIDI data
                 let mut packet = RtpPacket::new(ssrc, sequence, rtp_timestamp);
-                packet.add_command(0, midi_data);
+                
+                // Collect the first event and any additional queued events for batching
+                let mut events = vec![(first_midir_timestamp, first_midi_data)];
+                
+                // Peek the channel for additional events to batch into the same packet
+                // This optimization reduces network overhead by sending multiple MIDI
+                // commands in a single RTP packet when events are already queued
+                while let Ok((timestamp, data)) = input_rx.try_recv() {
+                    events.push((timestamp, data));
+                    
+                    // Limit batch size to prevent packets from becoming too large
+                    // RTP-MIDI packets should stay within reasonable MTU bounds
+                    if events.len() >= 32 {
+                        break;
+                    }
+                }
+                
+                debug!("Batching {} MIDI events into single packet", events.len());
+                
+                // Add all events to the packet with appropriate delta times
+                let mut last_timestamp = first_midir_timestamp;
+                for (idx, (event_timestamp, midi_data)) in events.into_iter().enumerate() {
+                    // For the first event, use delta_time of 0
+                    // For subsequent events, calculate delta based on timestamp difference
+                    let delta_time = if idx == 0 {
+                        0
+                    } else {
+                        // Calculate delta in RTP MIDI time units (10kHz clock)
+                        // Convert microsecond difference to 10kHz units
+                        event_timestamp.saturating_sub(last_timestamp)
+                            .min(u32::MAX as u64) as u32
+                    };
+                    
+                    packet.add_command(delta_time, midi_data);
+                    last_timestamp = event_timestamp;
+                }
                 
                 // Serialize packet once outside the loop
                 let packet_bytes = packet.to_bytes();

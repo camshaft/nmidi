@@ -399,4 +399,34 @@ mod tests {
         assert_eq!(bytes[10], 0xDE);
         assert_eq!(bytes[11], 0xF0);
     }
+
+    #[test]
+    fn test_rtp_packet_batching_multiple_commands() {
+        // Test batching multiple MIDI commands in a single RTP packet
+        let mut packet = RtpPacket::new(12345, 100, 1000);
+        
+        // Add multiple MIDI commands with delta times
+        packet.add_command(0, vec![0x90, 0x3C, 0x64]); // Note On, delta_time=0
+        packet.add_command(10, vec![0x90, 0x3E, 0x64]); // Note On, delta_time=10
+        packet.add_command(5, vec![0x80, 0x3C, 0x00]); // Note Off, delta_time=5
+        
+        // Serialize and parse
+        let bytes = packet.to_bytes();
+        let parsed = RtpPacket::parse(&bytes).unwrap();
+        
+        // Verify all commands are preserved
+        assert_eq!(parsed.commands.len(), 3);
+        
+        // Verify first command
+        assert_eq!(parsed.commands[0].delta_time, 0);
+        assert_eq!(parsed.commands[0].data, vec![0x90, 0x3C, 0x64]);
+        
+        // Verify second command
+        assert_eq!(parsed.commands[1].delta_time, 10);
+        assert_eq!(parsed.commands[1].data, vec![0x90, 0x3E, 0x64]);
+        
+        // Verify third command
+        assert_eq!(parsed.commands[2].delta_time, 5);
+        assert_eq!(parsed.commands[2].data, vec![0x80, 0x3C, 0x00]);
+    }
 }
