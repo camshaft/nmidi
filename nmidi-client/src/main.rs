@@ -84,7 +84,10 @@ async fn main() -> Result<()> {
             let remote_addr: SocketAddr = format!("{}:{}", host, port).parse()?;
             info!("Connecting to {}...", remote_addr);
 
-            let sockets = NetworkSockets::bind(&bind, &format!("{}:0", bind.split(':').next().unwrap_or("0.0.0.0"))).await?;
+            // Extract IP address from bind address for data socket
+            let bind_ip = bind.split(':').next().unwrap_or("0.0.0.0");
+            let data_bind = format!("{}:0", bind_ip);
+            let sockets = NetworkSockets::bind(&bind, &data_bind).await?;
 
             // Generate SSRC and token
             let ssrc = generate_ssrc();
