@@ -1,0 +1,18 @@
+[package]
+name = "nmidi-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+nmidi-core = { path = "../nmidi-core" }
+tokio.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+mdns-sd.workspace = true
+midir.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+hostname.workspace = true

@@ -1,0 +1,21 @@
+[workspace]
+members = ["nmidi-core", "nmidi-server", "nmidi-client"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+tokio = { version = "1.41", features = ["full"] }
+bytes = "1.9"
+byteorder = "1.5"
+thiserror = "2.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+mdns-sd = "0.17"
+midir = "0.10"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1.0"
+hostname = "0.4"
