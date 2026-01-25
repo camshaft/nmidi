@@ -1,14 +1,39 @@
 use anyhow::Result;
 use midir::{MidiInput, MidiOutput};
-use std::collections::HashMap;
+use std::collections::{HashMap, BinaryHeap};
+use std::cmp::Ordering;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex, mpsc};
+use tokio::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
 use nmidi_core::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION, network::NetworkSockets, util::{generate_ssrc, get_timestamp, micros_to_rtp_timestamp}};
 
 use crate::midi::{MidiPortInfo, MidiPortType};
+
+/// Scheduled MIDI event for future execution
+#[derive(Debug, Clone, Eq, PartialEq)]
+struct ScheduledMidiEvent {
+    /// Time to execute this event (Instant)
+    execute_at: Instant,
+    /// MIDI data to send
+    data: Vec<u8>,
+}
+
+// Implement Ord for BinaryHeap (min-heap: earliest events first)
+impl Ord for ScheduledMidiEvent {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Reverse ordering so BinaryHeap becomes a min-heap
+        other.execute_at.cmp(&self.execute_at)
+    }
+}
+
+impl PartialOrd for ScheduledMidiEvent {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
 
 #[derive(Debug, Clone)]
 struct SessionState {
@@ -18,6 +43,11 @@ struct SessionState {
     data_addr: SocketAddr,
     sequence: u16,
     timestamp: u32,
+    /// Time offset in microseconds: peer_time = local_time + offset
+    /// Calculated from AppleMIDI synchronization packets
+    time_offset: i64,
+    /// Last synchronization count received from peer
+    last_sync_count: u8,
 }
 
 pub struct SessionManager {
@@ -120,17 +150,92 @@ impl SessionManager {
         
         info!("Connected to MIDI output port: {}", port_name);
         
-        // Spawn task to forward MIDI output to hardware
+        // Spawn task to forward MIDI output to hardware with scheduling
         let handle = tokio::spawn(async move {
-            // TODO: Implement MIDI scheduler to handle delta_time correctly.
-            // The scheduler should consume timestamped events from the channel
-            // and schedule them for execution at the appropriate time based on delta_time.
+            // Priority queue (min-heap) for scheduled events
+            let mut scheduled_events = BinaryHeap::new();
             
-            while let Some((timestamp, midi_data)) = midi_rx.recv().await {
-                debug!("Forwarding MIDI output: {:?} at timestamp {}", midi_data, timestamp);
+            // Base timestamp for the scheduler - set when we receive first event
+            let mut base_instant: Option<Instant> = None;
+            let mut base_timestamp: u64 = 0;
+            
+            loop {
+                // Check if we have any events ready to execute
+                let next_event_time: Option<Instant> = scheduled_events
+                    .peek()
+                    .map(|e: &ScheduledMidiEvent| e.execute_at);
                 
-                if let Err(e) = connection.send(&midi_data) {
-                    warn!("Failed to send MIDI data to output: {}", e);
+                let timeout_duration: Duration = if let Some(next_time) = next_event_time {
+                    // Calculate time until next event
+                    let now = Instant::now();
+                    if next_time <= now {
+                        // Event is ready now, don't wait
+                        Duration::from_micros(0)
+                    } else {
+                        next_time.saturating_duration_since(now)
+                    }
+                } else {
+                    // No scheduled events, wait indefinitely for new ones
+                    Duration::from_secs(3600) // 1 hour timeout as fallback
+                };
+                
+                // Wait for either a new event or timeout for scheduled event
+                let new_event = tokio::time::timeout(timeout_duration, midi_rx.recv()).await;
+                
+                match new_event {
+                    Ok(Some((rtp_timestamp, midi_data))) => {
+                        // Received a new MIDI event
+                        debug!("Received MIDI event for scheduling: timestamp={}, data={:?}", 
+                               rtp_timestamp, midi_data);
+                        
+                        // Initialize base timestamp on first event
+                        if base_instant.is_none() {
+                            base_instant = Some(Instant::now());
+                            base_timestamp = rtp_timestamp;
+                            debug!("Initialized scheduler base: timestamp={}", base_timestamp);
+                        }
+                        
+                        // Calculate when to execute this event relative to base time
+                        let base = base_instant.unwrap();
+                        let delta_ticks = rtp_timestamp.wrapping_sub(base_timestamp);
+                        
+                        // Convert RTP ticks (10kHz = 100us per tick) to microseconds
+                        let delta_micros = (delta_ticks as u64) * 100;
+                        
+                        // Calculate absolute execution time
+                        let execute_at = base + Duration::from_micros(delta_micros);
+                        
+                        scheduled_events.push(ScheduledMidiEvent {
+                            execute_at,
+                            data: midi_data,
+                        });
+                        
+                        debug!("Scheduled event for +{} us (delta_ticks={})", delta_micros, delta_ticks);
+                    }
+                    Ok(None) => {
+                        // Channel closed, exit
+                        debug!("MIDI output channel closed");
+                        break;
+                    }
+                    Err(_) => {
+                        // Timeout - check for scheduled events to execute
+                    }
+                }
+                
+                // Execute all events that are due
+                let now = Instant::now();
+                while let Some(event) = scheduled_events.peek() {
+                    if event.execute_at <= now {
+                        let event = scheduled_events.pop().unwrap();
+                        debug!("Executing scheduled MIDI event: {:?}", event.data);
+                        
+                        if let Err(e) = connection.send(&event.data) {
+                            warn!("Failed to send MIDI data to output: {}", e);
+                        }
+                    } else {
+                        // Next event is in the future
+                        break;
+                    }
                 }
             }
             
@@ -352,6 +457,8 @@ impl SessionManager {
                         data_addr,
                         sequence: 0,
                         timestamp: 0,
+                        time_offset: 0,
+                        last_sync_count: 0,
                     },
                 );
 
@@ -388,6 +495,50 @@ impl SessionManager {
             } => {
                 info!("Received sync from SSRC {} (count {})", peer_ssrc, count);
 
+                // Get current time for response
+                let now = get_timestamp();
+                
+                // Update session with time synchronization info
+                if timestamp2 > 0 {
+                    // This is a response to our sync request (count is odd)
+                    // Calculate time offset: peer_time = local_time + offset
+                    // timestamp1 = peer's send time
+                    // timestamp2 = our receive time (from our original request)
+                    // timestamp3 = peer's response time
+                    // now = our current time
+                    
+                    // Round trip time
+                    let rtt = now.saturating_sub(timestamp2);
+                    
+                    // Estimated one-way latency (half of RTT)
+                    let latency = rtt / 2;
+                    
+                    // Peer's time when we received this response
+                    let peer_time_estimate = timestamp1.saturating_add(latency);
+                    
+                    // Calculate offset: how much to add to local time to get peer time
+                    let time_offset = (peer_time_estimate as i64) - (now as i64);
+                    
+                    debug!(
+                        "Sync from {}: offset={}, rtt={}, latency={}",
+                        peer_ssrc, time_offset, rtt, latency
+                    );
+                    
+                    // Update session state with synchronization info
+                    let mut sessions_lock = sessions.lock().await;
+                    if let Some(session) = sessions_lock.get_mut(&peer_ssrc) {
+                        session.time_offset = time_offset;
+                        session.last_sync_count = count;
+                    }
+                } else {
+                    // This is an initial sync request (count is even, timestamp2 == 0)
+                    // Just store the count, we'll respond below
+                    let mut sessions_lock = sessions.lock().await;
+                    if let Some(session) = sessions_lock.get_mut(&peer_ssrc) {
+                        session.last_sync_count = count;
+                    }
+                }
+
                 // Get session address without holding lock
                 let session_addr = {
                     let sessions_lock = sessions.lock().await;
@@ -401,7 +552,7 @@ impl SessionManager {
                         count: count + 1,
                         timestamp1,
                         timestamp2,
-                        timestamp3: get_timestamp(),
+                        timestamp3: now,
                     };
                     sockets.send_control(&response, &addr).await?;
                 }
@@ -412,11 +563,11 @@ impl SessionManager {
     }
 
     async fn handle_data_packet(
-        _sessions: &Arc<Mutex<HashMap<u32, SessionState>>>,
+        sessions: &Arc<Mutex<HashMap<u32, SessionState>>>,
         port_type: MidiPortType,
         midi_tx: &mpsc::Sender<(u64, Vec<u8>)>,
         packet: RtpPacket,
-        _addr: SocketAddr,
+        addr: SocketAddr,
     ) -> Result<()> {
         // Only forward to MIDI output ports
         if port_type == MidiPortType::Output {
@@ -424,9 +575,38 @@ impl SessionManager {
             // the journal/recovery mechanism. Need to handle recovery information correctly
             // to get things on track in case of packet loss (RFC 6295 Section 5)
             
+            // Look up the session to get time synchronization info
+            let time_offset = {
+                let sessions_lock = sessions.lock().await;
+                // Find session by checking data address (addr is the data port)
+                sessions_lock
+                    .values()
+                    .find(|s| s.data_addr == addr)
+                    .map(|s| s.time_offset)
+                    .unwrap_or(0)
+            };
+            
+            debug!("Processing RTP packet from {}, time_offset={}", addr, time_offset);
+            
             // Start from the RTP packet timestamp and add each command's delta_time to
             // compute a scheduled timestamp for that command.
-            let mut current_timestamp = packet.header.timestamp as u64;
+            // The RTP timestamp is in the peer's timebase (10kHz clock).
+            // Convert it to our local timebase using the time offset.
+            
+            // RTP timestamp is in 10kHz ticks (100us per tick)
+            let rtp_timestamp_micros = (packet.header.timestamp as u64) * 100;
+            
+            // Apply time offset to convert from peer time to local time
+            // time_offset is in microseconds: peer_time = local_time + offset
+            // Therefore: local_time = peer_time - offset
+            let base_local_micros = if time_offset >= 0 {
+                rtp_timestamp_micros.saturating_sub(time_offset as u64)
+            } else {
+                rtp_timestamp_micros.saturating_add((-time_offset) as u64)
+            };
+            
+            // Convert back to RTP ticks for internal consistency
+            let mut current_timestamp = base_local_micros / 100;
             
             for cmd in &packet.commands {
                 // Accumulate delta times to get an absolute scheduled timestamp
@@ -440,7 +620,7 @@ impl SessionManager {
                 );
                 
                 // Send MIDI data with the computed scheduled timestamp to the output channel.
-                // The output task can now schedule playback based on this timestamp.
+                // The output task will schedule playback based on this timestamp.
                 // Use try_send with timeout to avoid blocking if channel is full
                 match midi_tx.try_send((current_timestamp, cmd.data.clone())) {
                     Ok(_) => {},
@@ -456,5 +636,127 @@ impl SessionManager {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::time::Instant;
+
+    #[test]
+    fn test_scheduled_midi_event_ordering() {
+        // Test that ScheduledMidiEvent implements correct ordering for min-heap
+        let now = Instant::now();
+        let event1 = ScheduledMidiEvent {
+            execute_at: now + Duration::from_millis(100),
+            data: vec![0x90, 0x3C, 0x64],
+        };
+        let event2 = ScheduledMidiEvent {
+            execute_at: now + Duration::from_millis(50),
+            data: vec![0x80, 0x3C, 0x00],
+        };
+        let event3 = ScheduledMidiEvent {
+            execute_at: now + Duration::from_millis(200),
+            data: vec![0xB0, 0x07, 0x7F],
+        };
+
+        let mut heap = BinaryHeap::new();
+        heap.push(event1.clone());
+        heap.push(event2.clone());
+        heap.push(event3.clone());
+
+        // In a min-heap, earliest event should come first
+        assert_eq!(heap.pop().unwrap().execute_at, event2.execute_at);
+        assert_eq!(heap.pop().unwrap().execute_at, event1.execute_at);
+        assert_eq!(heap.pop().unwrap().execute_at, event3.execute_at);
+    }
+
+    #[test]
+    fn test_time_offset_calculation() {
+        // Test time offset calculation logic
+        // Simulate a peer that is 1000 microseconds ahead
+        let peer_send_time = 10000u64; // timestamp1
+        let our_receive_time = 9000u64; // timestamp2 (we're behind)
+        let rtt = 200u64;
+        let latency = rtt / 2;
+        
+        let peer_time_estimate = peer_send_time.saturating_add(latency);
+        let our_current_time = our_receive_time + rtt;
+        let time_offset = (peer_time_estimate as i64) - (our_current_time as i64);
+        
+        // peer_time_estimate = 10000 + 100 = 10100
+        // our_current_time = 9000 + 200 = 9200
+        // time_offset = 10100 - 9200 = 900
+        assert_eq!(time_offset, 900);
+    }
+
+    #[test]
+    fn test_rtp_timestamp_conversion() {
+        // Test RTP timestamp to microseconds conversion
+        let rtp_timestamp: u32 = 1000;
+        let micros = (rtp_timestamp as u64) * 100;
+        assert_eq!(micros, 100_000);
+
+        // Test wrapping behavior
+        let rtp_timestamp_max: u32 = u32::MAX;
+        let micros_max = (rtp_timestamp_max as u64) * 100;
+        assert_eq!(micros_max, 429496729500);
+    }
+
+    #[test]
+    fn test_session_state_initialization() {
+        // Test that SessionState initializes with correct defaults
+        let session = SessionState {
+            ssrc: 12345,
+            token: 67890,
+            addr: "127.0.0.1:5004".parse().unwrap(),
+            data_addr: "127.0.0.1:5005".parse().unwrap(),
+            sequence: 0,
+            timestamp: 0,
+            time_offset: 0,
+            last_sync_count: 0,
+        };
+
+        assert_eq!(session.ssrc, 12345);
+        assert_eq!(session.token, 67890);
+        assert_eq!(session.time_offset, 0);
+        assert_eq!(session.last_sync_count, 0);
+    }
+
+    #[test]
+    fn test_timestamp_with_time_offset() {
+        // Test converting peer RTP timestamp to local time
+        let peer_rtp_timestamp: u32 = 5000; // in 10kHz ticks
+        let time_offset: i64 = 10000; // peer is 10000 microseconds ahead
+        
+        // Convert to microseconds
+        let rtp_timestamp_micros = (peer_rtp_timestamp as u64) * 100;
+        assert_eq!(rtp_timestamp_micros, 500_000);
+        
+        // Apply time offset (peer_time = local_time + offset)
+        // Therefore: local_time = peer_time - offset
+        let local_micros = rtp_timestamp_micros.saturating_sub(time_offset as u64);
+        assert_eq!(local_micros, 490_000);
+        
+        // Convert back to RTP ticks
+        let local_rtp_timestamp = local_micros / 100;
+        assert_eq!(local_rtp_timestamp, 4900);
+    }
+
+    #[test]
+    fn test_timestamp_with_negative_offset() {
+        // Test when peer is behind us (negative offset)
+        let peer_rtp_timestamp: u32 = 5000;
+        let time_offset: i64 = -10000; // peer is 10000 microseconds behind
+        
+        let rtp_timestamp_micros = (peer_rtp_timestamp as u64) * 100;
+        
+        // When offset is negative, we add it
+        let local_micros = rtp_timestamp_micros.saturating_add((-time_offset) as u64);
+        assert_eq!(local_micros, 510_000);
+        
+        let local_rtp_timestamp = local_micros / 100;
+        assert_eq!(local_rtp_timestamp, 5100);
     }
 }
