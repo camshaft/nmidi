@@ -270,6 +270,7 @@ fn spawn_virtual_output_task(
     
     // Create virtual MIDI input port that local apps can send to
     // (from the local app's perspective, this is an output destination)
+    // Keep the connection alive for the duration of the task
     let _connection = midi_in
         .create_virtual(
             &port_name,
@@ -283,6 +284,7 @@ fn spawn_virtual_output_task(
         .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI port: {:?}", e))?;
     
     // Spawn task to forward MIDI to network
+    // The connection must stay alive for the duration, so we move it into the task
     Ok(tokio::spawn(async move {
         let mut sequence = 0u16;
         
@@ -314,7 +316,8 @@ fn spawn_virtual_output_task(
             }
         }
         
-        // _connection is dropped here when task ends
+        // Connection is kept alive by moving it into this task scope
+        drop(_connection);
     }))
 }
 
@@ -339,12 +342,15 @@ fn spawn_virtual_input_task(
         loop {
             match sockets.data.recv_from(&mut buf).await {
                 Ok((len, addr)) => {
-                    // Skip AppleMIDI control packets (signature 0xFFFF)
-                    if len >= 2 {
-                        let sig = u16::from_be_bytes([buf[0], buf[1]]);
-                        if sig == APPLEMIDI_SIGNATURE {
-                            continue;
-                        }
+                    // Skip AppleMIDI control packets (check for signature 0xFFFF)
+                    // Also ensure we have at least minimum RTP header size (12 bytes)
+                    if len < 12 {
+                        continue;
+                    }
+                    
+                    let sig = u16::from_be_bytes([buf[0], buf[1]]);
+                    if sig == APPLEMIDI_SIGNATURE {
+                        continue;
                     }
                     
                     // Parse RTP packet
