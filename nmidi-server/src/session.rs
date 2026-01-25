@@ -27,7 +27,6 @@ pub struct SessionManager {
     sessions: Arc<Mutex<HashMap<u32, SessionState>>>,
     port_info: MidiPortInfo,
     midi_output: Arc<Mutex<Option<MidiOutputConnection>>>,
-    midi_input_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl SessionManager {
@@ -36,7 +35,7 @@ impl SessionManager {
         let sockets = NetworkSockets::bind_consecutive(&bind_addr).await?;
         
         // Connect to MIDI port based on type
-        let (midi_output, midi_input_tx) = match port_info.port_type {
+        let midi_output = match port_info.port_type {
             MidiPortType::Output => {
                 // For output ports, we receive MIDI from network and send to local MIDI device
                 let midi_out = MidiOutput::new(&format!("nmidi-server-{}", name))?;
@@ -51,12 +50,12 @@ impl SessionManager {
                     .map_err(|e| anyhow::anyhow!("Failed to connect to MIDI output: {:?}", e))?;
                 info!("Connected to MIDI output port: {}", port_info.name);
                 
-                (Some(connection), None)
+                Some(connection)
             }
             MidiPortType::Input => {
                 // For input ports, we read from local MIDI device and send to network
                 // We'll set this up later in the run() method
-                (None, None)
+                None
             }
         };
         
@@ -67,7 +66,6 @@ impl SessionManager {
             sessions: Arc::new(Mutex::new(HashMap::new())),
             port_info,
             midi_output: Arc::new(Mutex::new(midi_output)),
-            midi_input_tx,
         })
     }
 
@@ -85,7 +83,7 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
-    pub async fn run(mut self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
+    pub async fn run(self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
         let sockets = Arc::clone(&self.sockets);
         let sessions = Arc::clone(&self.sessions);
         let name = self.name.clone();
@@ -143,7 +141,6 @@ impl SessionManager {
             
             // Create channel for MIDI input
             let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-            self.midi_input_tx = Some(input_tx.clone());
             
             // Connect to MIDI input port with callback
             let connection = midi_in.connect(
