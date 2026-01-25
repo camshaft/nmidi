@@ -5,8 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-nmidi-protocol = { path = "../nmidi-protocol" }
-nmidi-common = { path = "../nmidi-common" }
+nmidi-core = { path = "../nmidi-core" }
 tokio.workspace = true
 bytes.workspace = true
 thiserror.workspace = true

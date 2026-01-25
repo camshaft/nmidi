@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
-use nmidi_protocol::{AppleMidiPacket, RtpPacket};
+use crate::{AppleMidiPacket, RtpPacket};
 
 /// Maximum UDP payload size for MIDI packets (MTU - IP header - UDP header)
 const MAX_UDP_PAYLOAD: usize = 1500;

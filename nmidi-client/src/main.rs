@@ -4,8 +4,7 @@ use std::net::SocketAddr;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use nmidi_protocol::{AppleMidiPacket, APPLEMIDI_VERSION};
-use nmidi_common::{discovery, network::NetworkSockets, util::{generate_ssrc, generate_token, get_hostname}};
+use nmidi_core::{AppleMidiPacket, APPLEMIDI_VERSION, discovery, network::NetworkSockets, util::{generate_ssrc, generate_token, get_hostname}};
 
 #[derive(Parser, Debug)]
 #[command(name = "nmidi-client")]
@@ -105,6 +104,9 @@ async fn main() -> Result<()> {
             info!("Sent invitation to {}", remote_addr);
 
             // Wait for response with retry
+            // TODO: Implement proper state machine for connection handling
+            // (states: Connecting -> Connected -> Disconnected/Rejected)
+            // to handle protocol events more robustly
             let mut attempts = 0;
             let max_attempts = 3;
             

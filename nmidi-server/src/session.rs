@@ -5,9 +5,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use nmidi_protocol::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION};
-use nmidi_common::network::NetworkSockets;
-use nmidi_common::util::{generate_ssrc, get_timestamp};
+use nmidi_core::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION, network::NetworkSockets, util::{generate_ssrc, get_timestamp}};
 
 #[derive(Debug, Clone)]
 struct SessionState {

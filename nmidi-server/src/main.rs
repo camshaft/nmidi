@@ -49,6 +49,9 @@ async fn main() -> Result<()> {
     info!("Data port: {}", args.control_port + 1);
 
     // Detect MIDI ports (may not be available in all environments)
+    // TODO: Implement continuous MIDI port detection with background task
+    // using tokio::watch to publish port state changes and dynamically
+    // add/remove advertised services as ports are connected/disconnected
     let _midi_ports = match midi::detect_ports() {
         Ok(ports) => {
             info!("Found {} MIDI input ports", ports.inputs.len());
@@ -73,7 +76,10 @@ async fn main() -> Result<()> {
     .await?;
 
     // Start mDNS service discovery
-    let _mdns_service = nmidi_common::discovery::advertise_service(
+    // TODO: Support advertising multiple endpoints (one per MIDI port)
+    // by registering separate mDNS services for each input/output port
+    // with appropriate metadata to indicate port type and capabilities
+    let _mdns_service = nmidi_core::discovery::advertise_service(
         &args.name,
         args.control_port,
     )?;

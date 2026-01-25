@@ -4,9 +4,9 @@ MIDI Over Network Daemon - RTP-MIDI implementation with client and server
 
 ## Overview
 
-`nmidi` is a Rust-based implementation of the RTP-MIDI (AppleMIDI) protocol that enables MIDI communication over IP networks. It consists of three main components:
+`nmidi` is a Rust-based implementation of the RTP-MIDI (AppleMIDI) protocol that enables MIDI communication over IP networks. It consists of two main components:
 
-- **nmidi-protocol**: Core protocol library implementing AppleMIDI session management and RTP-MIDI packet encoding/decoding
+- **nmidi-core**: Core library implementing AppleMIDI session management, RTP-MIDI packet encoding/decoding, network sockets, and mDNS discovery
 - **nmidi-server**: Network MIDI server that exposes local MIDI ports over the network
 - **nmidi-client**: Network MIDI client that connects to remote MIDI services
 
@@ -69,24 +69,15 @@ The server will:
 
 ### Client
 
-Connect to a remote MIDI server:
+The client uses subcommands for better user experience.
 
-```bash
-./target/release/nmidi-client --host 192.168.1.100 --port 5004
-```
-
-Or browse for available services:
-
-```bash
-./target/release/nmidi-client --browse
-```
+Discover services on the network:
 
 Options:
-- `-H, --host <HOST>`: Remote host to connect to
+- `-H, --host <HOST>`: Remote host to connect to (required for connect)
 - `-p, --port <PORT>`: Remote control port (default: 5004)
-- `-n, --name <NAME>`: Device name (default: "nmidi-client")
+- `-n, --name <NAME>`: Device name (defaults to system hostname)
 - `-b, --bind <ADDR>`: Local bind address (default: "0.0.0.0:0")
-- `-B, --browse`: Browse for services instead of connecting directly
 - `-l, --log-level <LEVEL>`: Log level
 
 ## Protocol Implementation
@@ -125,7 +116,7 @@ Uses DNS-SD over mDNS:
 Run the protocol tests:
 
 ```bash
-cargo test --package nmidi-protocol
+cargo test
 ```
 
 ### Manual Testing
@@ -137,83 +128,16 @@ cargo test --package nmidi-protocol
 
 2. From another machine (or terminal), browse for services:
    ```bash
-   ./target/release/nmidi-client --browse
+   ./target/release/nmidi-client discover
    ```
 
 3. Connect to the server:
    ```bash
-   ./target/release/nmidi-client --host <server-ip> --port 5004
+   ./target/release/nmidi-client connect --host <server-ip>
+   ```
    ```
 
 4. On macOS, open "Audio MIDI Setup" → "MIDI Studio" → "Network" to see the advertised service
-
-## Architecture
-
-```
-┌─────────────────────┐         ┌─────────────────────┐
-│   nmidi-server      │         │   nmidi-client      │
-├─────────────────────┤         ├─────────────────────┤
-│ - MIDI Detection    │         │ - Service Browser   │
-│ - mDNS Advertiser   │◄───────►│ - Connection Mgmt   │
-│ - Session Manager   │         │ - MIDI I/O          │
-│ - UDP Sockets       │         │ - UDP Sockets       │
-└──────┬──────────────┘         └──────┬──────────────┘
-       │                               │
-       │    nmidi-protocol (shared)    │
-       │  ┌───────────────────────┐    │
-       └─►│ - AppleMIDI Protocol  │◄───┘
-          │ - RTP-MIDI Packets    │
-          │ - Packet Encoding     │
-          └───────────────────────┘
-```
-
-## Project Structure
-
-```
-nmidi/
-├── Cargo.toml              # Workspace configuration
-├── nmidi-protocol/         # Core protocol library
-│   ├── src/
-│   │   ├── lib.rs
-│   │   ├── applemidi.rs    # AppleMIDI protocol
-│   │   ├── rtp.rs          # RTP-MIDI protocol
-│   │   └── error.rs        # Error types
-│   └── Cargo.toml
-├── nmidi-server/           # Server binary
-│   ├── src/
-│   │   ├── main.rs
-│   │   ├── discovery.rs    # mDNS service advertisement
-│   │   ├── midi.rs         # MIDI port detection
-│   │   ├── network.rs      # UDP socket management
-│   │   └── session.rs      # Session state management
-│   └── Cargo.toml
-└── nmidi-client/           # Client binary
-    ├── src/
-    │   ├── main.rs
-    │   ├── discovery.rs    # mDNS service browsing
-    │   └── network.rs      # UDP socket management
-    └── Cargo.toml
-```
-
-## Dependencies
-
-- **tokio**: Async runtime
-- **midir**: Cross-platform MIDI I/O
-- **mdns-sd**: mDNS service discovery
-- **bytes**: Efficient byte buffer management
-- **byteorder**: Endian-aware binary encoding
-- **clap**: Command-line argument parsing
-- **tracing**: Structured logging
-
-## Future Enhancements
-
-- [ ] Recovery journal implementation for packet loss handling
-- [ ] Support for multiple simultaneous sessions
-- [ ] MIDI port selection via command-line
-- [ ] Bidirectional MIDI routing (network → local output)
-- [ ] Latency monitoring and reporting
-- [ ] Configuration file support
-- [ ] systemd service files for Linux
 
 ## License
 

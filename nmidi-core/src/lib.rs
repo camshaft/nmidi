@@ -1,6 +1,9 @@
 pub mod applemidi;
 pub mod rtp;
 pub mod error;
+pub mod discovery;
+pub mod network;
+pub mod util;
 
 pub use applemidi::{AppleMidiCommand, AppleMidiPacket};
 pub use rtp::{RtpPacket, MidiCommand};

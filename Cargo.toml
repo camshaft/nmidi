@@ -1,5 +1,5 @@
 [workspace]
-members = ["nmidi-protocol", "nmidi-common", "nmidi-server", "nmidi-client"]
+members = ["nmidi-core", "nmidi-server", "nmidi-client"]
 resolver = "2"
 
 [workspace.package]

@@ -1,11 +1,15 @@
 [package]
-name = "nmidi-protocol"
+name = "nmidi-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
+tokio.workspace = true
 bytes.workspace = true
 byteorder.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
+mdns-sd.workspace = true
+anyhow.workspace = true
+hostname.workspace = true
