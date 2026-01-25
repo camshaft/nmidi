@@ -93,6 +93,42 @@ impl SessionManager {
         let midi_output = Arc::clone(&self.midi_output);
         let port_type = self.port_info.port_type;
 
+        // Helper function to handle shutdown
+        async fn handle_shutdown(
+            name: &str,
+            ssrc: u32,
+            sockets: &NetworkSockets,
+            sessions: &Arc<Mutex<HashMap<u32, SessionState>>>,
+        ) -> Result<()> {
+            info!("Shutting down session manager for {}", name);
+            
+            // Send End packets to all peers
+            let sessions_snapshot = {
+                let sessions_lock = sessions.lock().await;
+                sessions_lock.clone()
+            };
+
+            for (peer_ssrc, session_state) in sessions_snapshot {
+                let end_packet = AppleMidiPacket::End {
+                    version: APPLEMIDI_VERSION,
+                    token: session_state.token,
+                    ssrc,
+                };
+                
+                if let Err(e) = sockets.send_control(&end_packet, &session_state.addr).await {
+                    warn!("Failed to send End packet to peer {}: {}", peer_ssrc, e);
+                } else {
+                    info!("Sent End packet to peer {}", peer_ssrc);
+                }
+            }
+
+            // Clear all sessions
+            let mut sessions_lock = sessions.lock().await;
+            sessions_lock.clear();
+            
+            Ok(())
+        }
+
         // Set up MIDI input forwarding if this is an input port
         let midi_input_handle = if port_type == MidiPortType::Input {
             let midi_in = MidiInput::new(&format!("nmidi-server-{}", name))?;
@@ -218,31 +254,7 @@ impl SessionManager {
         if let Some(midi_handle) = midi_input_handle {
             tokio::select! {
                 _ = &mut shutdown_rx => {
-                    info!("Shutting down session manager for {}", name);
-                    
-                    // Send End packets to all peers
-                    let sessions_snapshot = {
-                        let sessions_lock = sessions.lock().await;
-                        sessions_lock.clone()
-                    };
-
-                    for (peer_ssrc, session_state) in sessions_snapshot {
-                        let end_packet = AppleMidiPacket::End {
-                            version: APPLEMIDI_VERSION,
-                            token: session_state.token,
-                            ssrc,
-                        };
-                        
-                        if let Err(e) = sockets.send_control(&end_packet, &session_state.addr).await {
-                            warn!("Failed to send End packet to peer {}: {}", peer_ssrc, e);
-                        } else {
-                            info!("Sent End packet to peer {}", peer_ssrc);
-                        }
-                    }
-
-                    // Clear all sessions
-                    let mut sessions_lock = sessions.lock().await;
-                    sessions_lock.clear();
+                    handle_shutdown(&name, ssrc, &sockets, &sessions).await?;
                 }
                 _ = control_handle => {
                     warn!("Control handler task ended unexpectedly");
@@ -257,31 +269,7 @@ impl SessionManager {
         } else {
             tokio::select! {
                 _ = &mut shutdown_rx => {
-                    info!("Shutting down session manager for {}", name);
-                    
-                    // Send End packets to all peers
-                    let sessions_snapshot = {
-                        let sessions_lock = sessions.lock().await;
-                        sessions_lock.clone()
-                    };
-
-                    for (peer_ssrc, session_state) in sessions_snapshot {
-                        let end_packet = AppleMidiPacket::End {
-                            version: APPLEMIDI_VERSION,
-                            token: session_state.token,
-                            ssrc,
-                        };
-                        
-                        if let Err(e) = sockets.send_control(&end_packet, &session_state.addr).await {
-                            warn!("Failed to send End packet to peer {}: {}", peer_ssrc, e);
-                        } else {
-                            info!("Sent End packet to peer {}", peer_ssrc);
-                        }
-                    }
-
-                    // Clear all sessions
-                    let mut sessions_lock = sessions.lock().await;
-                    sessions_lock.clear();
+                    handle_shutdown(&name, ssrc, &sockets, &sessions).await?;
                 }
                 _ = control_handle => {
                     warn!("Control handler task ended unexpectedly");
