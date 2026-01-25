@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::{oneshot, Mutex, mpsc};
 use tracing::{debug, info, warn};
 
-use nmidi_core::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION, network::NetworkSockets, util::{generate_ssrc, get_timestamp}};
+use nmidi_core::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION, network::NetworkSockets, util::{generate_ssrc, get_timestamp, micros_to_rtp_timestamp}};
 
 use crate::midi::{MidiPortInfo, MidiPortType};
 
@@ -196,13 +196,13 @@ impl SessionManager {
                     continue;
                 }
                 
-                // Convert midir timestamp to our timebase (microseconds since epoch)
-                // Note: midir timestamp is in platform-specific units, not directly usable as RTP timestamp
-                // TODO: Properly convert midir timebase to RTP MIDI timestamp timebase
-                let rtp_timestamp = get_timestamp() as u32;
+                // Convert midir timestamp to our timebase
+                // midir timestamp is in platform-specific units, not directly usable
+                // Get current time in microseconds and convert to RTP MIDI timestamp (10kHz clock rate)
+                let current_micros = get_timestamp();
+                let rtp_timestamp = micros_to_rtp_timestamp(current_micros);
                 
                 // Create RTP packet with MIDI data
-                // TODO: Encode timestamp in RTP MIDI's special delta format per RFC 6295
                 let mut packet = RtpPacket::new(ssrc, sequence, rtp_timestamp);
                 packet.add_command(0, midi_data);
                 

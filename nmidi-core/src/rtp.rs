@@ -362,4 +362,41 @@ mod tests {
         assert_eq!(packet.header.sequence, parsed.header.sequence);
         assert_eq!(packet.commands.len(), parsed.commands.len());
     }
+
+    #[test]
+    fn test_rtp_header_big_endian_encoding() {
+        // Test that sequence, timestamp, and ssrc are encoded in big-endian (network byte order)
+        let header = RtpHeader {
+            version: 2,
+            padding: false,
+            extension: false,
+            csrc_count: 0,
+            marker: false,
+            payload_type: 97,
+            sequence: 0x1234,
+            timestamp: 0x12345678,
+            ssrc: 0x9ABCDEF0,
+        };
+
+        let bytes = header.to_bytes();
+        
+        // Check the header is 12 bytes
+        assert_eq!(bytes.len(), 12);
+        
+        // Verify byte order for sequence (bytes 2-3)
+        assert_eq!(bytes[2], 0x12);
+        assert_eq!(bytes[3], 0x34);
+        
+        // Verify byte order for timestamp (bytes 4-7)
+        assert_eq!(bytes[4], 0x12);
+        assert_eq!(bytes[5], 0x34);
+        assert_eq!(bytes[6], 0x56);
+        assert_eq!(bytes[7], 0x78);
+        
+        // Verify byte order for ssrc (bytes 8-11)
+        assert_eq!(bytes[8], 0x9A);
+        assert_eq!(bytes[9], 0xBC);
+        assert_eq!(bytes[10], 0xDE);
+        assert_eq!(bytes[11], 0xF0);
+    }
 }
