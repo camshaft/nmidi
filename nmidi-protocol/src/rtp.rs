@@ -88,9 +88,7 @@ impl RtpHeader {
         ))
     }
 
-    pub fn to_bytes(&self) -> Bytes {
-        let mut buf = BytesMut::new();
-
+    pub fn write_to(&self, buf: &mut impl BufMut) {
         let byte0 = (self.version << 6)
             | ((self.padding as u8) << 5)
             | ((self.extension as u8) << 4)
@@ -103,7 +101,11 @@ impl RtpHeader {
         buf.put_u16(self.sequence);
         buf.put_u32(self.timestamp);
         buf.put_u32(self.ssrc);
+    }
 
+    pub fn to_bytes(&self) -> Bytes {
+        let mut buf = BytesMut::new();
+        self.write_to(&mut buf);
         buf.freeze()
     }
 }
@@ -185,10 +187,9 @@ impl RtpPacket {
         // Parse MIDI commands
         while cursor.position() < data.len() as u64 {
             // If we have a journal flag and we've parsed some commands,
-            // we might be reaching the journal section. The journal section
-            // is not implemented yet, so we stop parsing here.
-            // A proper implementation would check the actual journal format
-            // per RFC 6295 Section 5.
+            // we might be reaching the journal section.
+            // TODO: Implement proper journal section detection and parsing
+            // per RFC 6295 Section 5 (Recovery Journal).
             if has_journal && !commands.is_empty() {
                 // Check if remaining data looks like a journal header
                 let remaining = data.len() as u64 - cursor.position();

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 nmidi-protocol = { path = "../nmidi-protocol" }
+nmidi-common = { path = "../nmidi-common" }
 tokio.workspace = true
 bytes.workspace = true
 thiserror.workspace = true
@@ -15,3 +16,4 @@ mdns-sd.workspace = true
 midir.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+hostname.workspace = true

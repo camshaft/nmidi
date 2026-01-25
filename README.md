@@ -17,13 +17,13 @@ This implementation follows the specifications in:
 
 ## Features
 
-- ✅ AppleMIDI protocol support (session handshake, synchronization)
-- ✅ RTP-MIDI packet encoding/decoding
-- ✅ mDNS-based service discovery (`_apple-midi._udp`)
-- ✅ UDP-based transport (control and data channels)
-- ✅ Automatic MIDI port detection
-- ✅ Compatible with macOS Audio MIDI Setup
-- ✅ Cross-platform (Linux, macOS, Windows with ALSA/CoreMIDI/WinMM)
+- AppleMIDI protocol support (session handshake, synchronization)
+- RTP-MIDI packet encoding/decoding
+- mDNS-based service discovery (`_apple-midi._udp`)
+- UDP-based transport (control and data channels)
+- Automatic MIDI port detection
+- Compatible with macOS Audio MIDI Setup
+- Cross-platform (Linux, macOS, Windows with ALSA/CoreMIDI/WinMM)
 
 ## Building
 

@@ -27,7 +27,7 @@ impl NetworkSockets {
     }
 
     pub async fn recv_control(&self) -> Result<(AppleMidiPacket, SocketAddr)> {
-        let mut buf = vec![0u8; 1500];
+        let mut buf = [0u8; 1500];
         let (len, addr) = self.control.recv_from(&mut buf).await?;
 
         match AppleMidiPacket::parse(&buf[..len]) {
@@ -54,7 +54,7 @@ impl NetworkSockets {
     }
 
     pub async fn recv_data(&self) -> Result<(RtpPacket, SocketAddr)> {
-        let mut buf = vec![0u8; 1500];
+        let mut buf = [0u8; 1500];
         let (len, addr) = self.data.recv_from(&mut buf).await?;
 
         match RtpPacket::parse(&buf[..len]) {

@@ -2,13 +2,12 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use nmidi_protocol::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION};
-
-use crate::network::NetworkSockets;
+use nmidi_common::network::NetworkSockets;
+use nmidi_common::util::{generate_ssrc, get_timestamp};
 
 #[derive(Debug, Clone)]
 struct SessionState {
@@ -172,9 +171,14 @@ impl SessionManager {
             } => {
                 info!("Received sync from SSRC {} (count {})", peer_ssrc, count);
 
-                // Respond to sync
-                let sessions_lock = sessions.lock().await;
-                if let Some(session) = sessions_lock.get(&peer_ssrc) {
+                // Get session address without holding lock
+                let session_addr = {
+                    let sessions_lock = sessions.lock().await;
+                    sessions_lock.get(&peer_ssrc).map(|s| s.addr)
+                };
+                
+                // Respond to sync without holding the lock
+                if let Some(addr) = session_addr {
                     let response = AppleMidiPacket::Synchronization {
                         ssrc,
                         count: count + 1,
@@ -182,7 +186,7 @@ impl SessionManager {
                         timestamp2,
                         timestamp3: get_timestamp(),
                     };
-                    sockets.send_control(&response, &session.addr).await?;
+                    sockets.send_control(&response, &addr).await?;
                 }
             }
         }
@@ -206,19 +210,4 @@ impl SessionManager {
 
         Ok(())
     }
-}
-
-fn generate_ssrc() -> u32 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
-    (now & 0xFFFFFFFF) as u32
-}
-
-fn get_timestamp() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_micros() as u64
 }

@@ -1,6 +1,4 @@
-mod discovery;
 mod midi;
-mod network;
 mod session;
 
 use anyhow::Result;
@@ -75,7 +73,7 @@ async fn main() -> Result<()> {
     .await?;
 
     // Start mDNS service discovery
-    let _mdns_service = discovery::advertise_service(
+    let _mdns_service = nmidi_common::discovery::advertise_service(
         &args.name,
         args.control_port,
     )?;
