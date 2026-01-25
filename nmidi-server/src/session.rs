@@ -230,7 +230,7 @@ impl SessionManager {
                 // Calculate initial packet size (RTP header + payload header + first command)
                 // RTP header is 12 bytes, payload flags are 1-2 bytes, plus command data
                 let mut estimated_size = 12 + 2; // RTP header + payload header
-                estimated_size += Self::estimate_command_size(0, &packet.commands[0].data);
+                estimated_size += SessionManager::estimate_command_size(0, &packet.commands[0].data);
                 
                 let mut event_count = 1;
                 
@@ -245,7 +245,7 @@ impl SessionManager {
                                 .min(u32::MAX as u64) as u32;
                             
                             // Estimate size this command would add to the packet
-                            let command_size = Self::estimate_command_size(delta_time, &midi_data);
+                            let command_size = SessionManager::estimate_command_size(delta_time, &midi_data);
                             
                             // Check if adding this command would exceed MTU
                             if estimated_size + command_size > MAX_PACKET_SIZE {
@@ -292,13 +292,14 @@ impl SessionManager {
 
     /// Estimate the byte size a MIDI command will add to an RTP packet
     /// This includes the variable-length delta_time encoding and the MIDI data
+    /// Variable-length encoding uses 7 bits per byte with the high bit as continuation flag
     fn estimate_command_size(delta_time: u32, midi_data: &[u8]) -> usize {
         // Estimate variable-length encoding of delta_time
         // Each byte encodes 7 bits, with the high bit indicating continuation
         let delta_size = if delta_time == 0 {
             1
         } else {
-            let mut bits = 32 - delta_time.leading_zeros();
+            let bits = 32 - delta_time.leading_zeros();
             ((bits + 6) / 7).max(1) as usize // Round up to nearest 7-bit group
         };
         
