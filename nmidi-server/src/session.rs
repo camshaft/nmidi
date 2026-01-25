@@ -446,9 +446,10 @@ impl SessionManager {
                     cmd.delta_time, cmd.data
                 );
                 
-                // Send MIDI data with timestamp to the output channel
+                // Send MIDI data with packet timestamp to the output channel
                 // The output task will handle scheduling based on delta_time
-                let timestamp = get_timestamp();
+                // Use the RTP packet timestamp for better accuracy
+                let timestamp = packet.header.timestamp as u64;
                 if let Err(e) = midi_tx.send((timestamp, cmd.data.clone())) {
                     warn!("Failed to send MIDI data to output channel: {}", e);
                 }
