@@ -545,7 +545,7 @@ fn spawn_virtual_input_task(
                                     let base_local_micros = if time_offset_micros >= 0 {
                                         rtp_timestamp_micros.saturating_sub(time_offset_micros as u64)
                                     } else {
-                                        rtp_timestamp_micros.saturating_add((-time_offset_micros) as u64)
+                                        rtp_timestamp_micros.saturating_add(time_offset_micros.unsigned_abs())
                                     };
                                     
                                     let mut current_timestamp_ticks = base_local_micros / 100;

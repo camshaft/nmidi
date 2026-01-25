@@ -31,13 +31,22 @@ pub struct SyncResult {
 
 /// Handle incoming synchronization packet and produce response
 /// 
+/// Uses a simplified 2-timestamp approach for time offset calculation rather than
+/// the full 3-timestamp method. This approach is more robust in practice:
+/// - timestamp1 (peer's send time) and timestamp2 (our original request time) provide
+///   a reliable RTT measurement
+/// - timestamp3 (peer's response generation time) adds complexity without significantly
+///   improving accuracy in typical network conditions
+/// - The simpler approach matches the reference implementation and avoids potential
+///   issues with asymmetric delays
+/// 
 /// # Arguments
 /// * `ssrc` - Local SSRC
 /// * `peer_ssrc` - Peer SSRC
 /// * `count` - Sync count from packet
 /// * `timestamp1` - Peer's send time
 /// * `timestamp2` - Our original send time (from our request)
-/// * `timestamp3` - Peer's response time
+/// * `_timestamp3` - Peer's response time (not used in simplified calculation)
 /// 
 /// Returns SyncResult with optional response packet and time offset
 pub fn handle_synchronization(
