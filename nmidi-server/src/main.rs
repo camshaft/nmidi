@@ -42,8 +42,9 @@ impl Drop for MidiService {
         // Send shutdown signal to gracefully close sessions
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
+            // Give a brief moment for shutdown to be processed, then abort
+            // The task will be cleaned up when JoinHandle is dropped
         }
-        // Abort the task if it's still running
         self.session_handle.abort();
     }
 }
