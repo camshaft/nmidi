@@ -5,7 +5,7 @@ mod session;
 
 use anyhow::Result;
 use clap::Parser;
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser, Debug)]
@@ -50,10 +50,21 @@ async fn main() -> Result<()> {
     info!("Control port: {}", args.control_port);
     info!("Data port: {}", args.control_port + 1);
 
-    // Detect MIDI ports
-    let midi_ports = midi::detect_ports()?;
-    info!("Found {} MIDI input ports", midi_ports.inputs.len());
-    info!("Found {} MIDI output ports", midi_ports.outputs.len());
+    // Detect MIDI ports (may not be available in all environments)
+    let _midi_ports = match midi::detect_ports() {
+        Ok(ports) => {
+            info!("Found {} MIDI input ports", ports.inputs.len());
+            info!("Found {} MIDI output ports", ports.outputs.len());
+            ports
+        }
+        Err(e) => {
+            warn!("Could not detect MIDI ports: {}. Continuing without MIDI hardware.", e);
+            midi::MidiPorts {
+                inputs: Vec::new(),
+                outputs: Vec::new(),
+            }
+        }
+    };
 
     // Create session manager
     let session_manager = session::SessionManager::new(

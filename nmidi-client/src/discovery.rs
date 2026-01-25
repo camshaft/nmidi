@@ -17,10 +17,11 @@ pub fn advertise_service(
     properties.insert("ver".to_string(), "2".to_string());
 
     // Register service
+    let hostname = format!("{}.local.", device_name);
     let service_info = ServiceInfo::new(
         SERVICE_TYPE,
         device_name,
-        device_name,
+        &hostname,
         "",
         control_port,
         Some(properties),
