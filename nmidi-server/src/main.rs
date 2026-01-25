@@ -160,6 +160,7 @@ async fn main() -> Result<()> {
         
         // Wait for port changes
         if port_rx.changed().await.is_err() {
+            info!("Port monitor channel closed, shutting down");
             break;
         }
     }

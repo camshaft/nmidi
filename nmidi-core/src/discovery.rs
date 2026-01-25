@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
 use std::collections::HashMap;
 use std::sync::Arc;
+use tracing::warn;
 
 const SERVICE_TYPE: &str = "_apple-midi._udp.local.";
 
@@ -60,7 +61,7 @@ pub struct Service {
 impl Drop for Service {
     fn drop(&mut self) {
         if let Err(e) = self.mdns.unregister(&self.fullname) {
-            tracing::warn!("Failed to unregister service {}: {}", self.fullname, e);
+            warn!("Failed to unregister service {}: {}", self.fullname, e);
         }
     }
 }
