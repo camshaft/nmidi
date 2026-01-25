@@ -17,6 +17,15 @@ pub enum MidiPortType {
     Output,
 }
 
+impl MidiPortType {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MidiPortType::Input => "input",
+            MidiPortType::Output => "output",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MidiPorts {
     pub inputs: Vec<MidiPortInfo>,
@@ -25,10 +34,7 @@ pub struct MidiPorts {
 
 impl MidiPorts {
     pub fn all_ports(&self) -> Vec<MidiPortInfo> {
-        let mut ports = Vec::new();
-        ports.extend(self.inputs.clone());
-        ports.extend(self.outputs.clone());
-        ports
+        self.inputs.iter().chain(self.outputs.iter()).cloned().collect()
     }
 }
 

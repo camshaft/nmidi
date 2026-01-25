@@ -74,13 +74,13 @@ async fn main() -> Result<()> {
     // Advertise initial ports
     let mut next_port = args.control_port;
     for port in initial_ports.all_ports() {
-        let port_key = format!("{:?}_{}", port.port_type, port.index);
+        let port_key = format!("{}_{}", port.port_type.as_str(), port.index);
         let service_name = format!("{}_{}", args.name, port_key);
         
         let mut properties = HashMap::new();
         properties.insert("name".to_string(), port.name.clone());
         properties.insert("ver".to_string(), "2".to_string());
-        properties.insert("type".to_string(), format!("{:?}", port.port_type));
+        properties.insert("type".to_string(), port.port_type.as_str().to_string());
         properties.insert("index".to_string(), port.index.to_string());
         
         match advertiser.advertise_service(&service_name, &args.name, next_port, properties) {
