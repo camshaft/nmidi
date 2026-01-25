@@ -242,20 +242,20 @@ async fn main() -> Result<()> {
                 last_status: None,
             }));
 
-            // Send initial synchronization request
-            let sync_request = create_sync_request(ssrc);
-            sockets.send_control(&sync_request, &remote_addr).await?;
-            info!("Sent initial synchronization request");
-
             let sockets = Arc::new(sockets);
 
-            // Spawn control handler for sync packets
+            // Spawn control handler for sync packets first
             let control_handle = spawn_control_handler(
                 Arc::clone(&sockets),
                 Arc::clone(&session_state),
                 ssrc,
                 remote_addr,
             );
+
+            // Send initial synchronization request after handler is ready
+            let sync_request = create_sync_request(ssrc);
+            sockets.send_control(&sync_request, &remote_addr).await?;
+            info!("Sent initial synchronization request");
 
             // Create virtual MIDI ports and start bidirectional forwarding
             let virtual_port_name = format!("nmidi-client: {}", port_name);
@@ -453,7 +453,8 @@ fn spawn_virtual_output_task(
                     // Apply time offset: peer_time = local_time + offset
                     let time_offset = session_state.lock().await.time_offset_ticks;
                     let peer_ticks = local_ticks.wrapping_add(time_offset);
-                    let rtp_timestamp = peer_ticks as u32;
+                    // Cast to u32 with wrapping (RTP timestamps are u32 and wrap naturally)
+                    let rtp_timestamp = (peer_ticks as u64 & 0xFFFFFFFF) as u32;
                     
                     debug!("Sending MIDI with local_ticks={}, offset={}, peer_ticks={}", 
                            local_ticks, time_offset, peer_ticks);
