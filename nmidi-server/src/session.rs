@@ -10,6 +10,11 @@ use nmidi_core::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION, network::Network
 
 use crate::midi::{MidiPortInfo, MidiPortType};
 
+/// Maximum number of MIDI events to batch into a single RTP packet
+/// This limit helps keep packets within reasonable MTU bounds (~1500 bytes)
+/// Assuming average MIDI message is ~3 bytes, 32 events = ~96 bytes + RTP overhead
+const MAX_BATCH_SIZE: usize = 32;
+
 #[derive(Debug, Clone)]
 struct SessionState {
     ssrc: u32,
@@ -215,8 +220,7 @@ impl SessionManager {
                     events.push((timestamp, data));
                     
                     // Limit batch size to prevent packets from becoming too large
-                    // RTP-MIDI packets should stay within reasonable MTU bounds
-                    if events.len() >= 32 {
+                    if events.len() >= MAX_BATCH_SIZE {
                         break;
                     }
                 }
@@ -231,8 +235,9 @@ impl SessionManager {
                     let delta_time = if idx == 0 {
                         0
                     } else {
-                        // Calculate delta in RTP MIDI time units (10kHz clock)
-                        // Convert microsecond difference to 10kHz units
+                        // midir timestamps are platform-specific units. We use them directly 
+                        // as relative deltas between events in the batch. The RTP packet 
+                        // timestamp (already converted to 10kHz) provides the absolute reference.
                         event_timestamp.saturating_sub(last_timestamp)
                             .min(u32::MAX as u64) as u32
                     };
