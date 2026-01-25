@@ -268,7 +268,8 @@ fn spawn_virtual_output_task(
     // Create channel for MIDI input
     let (input_tx, mut input_rx) = mpsc::channel::<(u64, Vec<u8>)>(100);
     
-    // Create virtual MIDI input to receive from local apps
+    // Create virtual MIDI input port that local apps can send to
+    // (from the local app's perspective, this is an output destination)
     let _connection = midi_in
         .create_virtual(
             &port_name,
@@ -313,8 +314,7 @@ fn spawn_virtual_output_task(
             }
         }
         
-        // Connection is dropped here when task ends
-        drop(_connection);
+        // _connection is dropped here when task ends
     }))
 }
 
@@ -326,7 +326,8 @@ fn spawn_virtual_input_task(
 ) -> Result<tokio::task::JoinHandle<()>> {
     let midi_out = MidiOutput::new("nmidi-client")?;
     
-    // Create virtual MIDI output for local apps to receive from
+    // Create virtual MIDI output port that local apps can receive from
+    // (from the local app's perspective, this is an input source)
     let mut connection = midi_out
         .create_virtual(&port_name)
         .map_err(|e| anyhow::anyhow!("Failed to create virtual MIDI port: {:?}", e))?;
@@ -338,7 +339,7 @@ fn spawn_virtual_input_task(
         loop {
             match sockets.data.recv_from(&mut buf).await {
                 Ok((len, addr)) => {
-                    // Skip AppleMIDI control packets
+                    // Skip AppleMIDI control packets (signature 0xFFFF)
                     if len >= 2 {
                         let sig = u16::from_be_bytes([buf[0], buf[1]]);
                         if sig == APPLEMIDI_SIGNATURE {
@@ -368,5 +369,7 @@ fn spawn_virtual_input_task(
                 }
             }
         }
+        
+        // connection is dropped here when task ends
     }))
 }
