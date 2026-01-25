@@ -4,6 +4,10 @@ use std::io::Cursor;
 
 use crate::error::ProtocolError;
 
+/// Maximum number of MIDI commands per RTP packet to prevent infinite loops
+/// during parsing of malformed packets
+const MAX_MIDI_COMMANDS_PER_PACKET: usize = 100;
+
 /// RTP packet header
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RtpHeader {
@@ -180,10 +184,18 @@ impl RtpPacket {
 
         // Parse MIDI commands
         while cursor.position() < data.len() as u64 {
-            // Check if we've reached the journal section
-            if has_journal && cursor.position() > data.len() as u64 / 2 {
-                // Simple heuristic to stop before journal
-                break;
+            // If we have a journal flag and we've parsed some commands,
+            // we might be reaching the journal section. The journal section
+            // is not implemented yet, so we stop parsing here.
+            // A proper implementation would check the actual journal format
+            // per RFC 6295 Section 5.
+            if has_journal && !commands.is_empty() {
+                // Check if remaining data looks like a journal header
+                let remaining = data.len() as u64 - cursor.position();
+                if remaining > 0 && remaining < 100 {
+                    // Likely in journal section, stop parsing MIDI commands
+                    break;
+                }
             }
 
             // Read delta time (variable length)
@@ -230,8 +242,8 @@ impl RtpPacket {
                 data: midi_data,
             });
 
-            // Simple check to prevent infinite loops
-            if commands.len() > 100 {
+            // Simple check to prevent infinite loops on malformed packets
+            if commands.len() > MAX_MIDI_COMMANDS_PER_PACKET {
                 break;
             }
         }

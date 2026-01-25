@@ -81,7 +81,7 @@ async fn main() -> Result<()> {
 
         info!("Connecting to {}...", remote_addr);
 
-        let sockets = network::NetworkSockets::bind(&args.bind, &format!("{}:0", args.bind.split(':').next().unwrap())).await?;
+        let sockets = network::NetworkSockets::bind(&args.bind, &format!("{}:0", args.bind.split(':').next().unwrap_or("0.0.0.0"))).await?;
 
         // Generate SSRC and token
         let ssrc = generate_ssrc();

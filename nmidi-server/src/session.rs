@@ -123,8 +123,9 @@ impl SessionManager {
                 };
                 sockets.send_control(&response, &addr).await?;
 
-                // Store session
-                let data_addr = SocketAddr::new(addr.ip(), addr.port() + 1);
+                // Store session - calculate data port safely
+                let data_port = addr.port().checked_add(1).unwrap_or(addr.port());
+                let data_addr = SocketAddr::new(addr.ip(), data_port);
                 let mut sessions_lock = sessions.lock().await;
                 sessions_lock.insert(
                     peer_ssrc,
