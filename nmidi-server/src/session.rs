@@ -36,6 +36,13 @@ impl SessionManager {
         })
     }
 
+    /// Get the control port the session manager is bound to
+    pub fn control_port(&self) -> u16 {
+        self.sockets.control.local_addr()
+            .map(|addr| addr.port())
+            .unwrap_or(0)
+    }
+
     pub async fn run(&self) -> Result<()> {
         let control_handle = {
             let sockets = Arc::clone(&self.sockets);

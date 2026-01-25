@@ -3,6 +3,7 @@ mod session;
 
 use anyhow::Result;
 use clap::Parser;
+use nmidi_core::discovery::Service;
 use std::collections::HashMap;
 use std::time::Duration;
 use tracing::{info, warn, Level};
@@ -16,10 +17,6 @@ struct Args {
     #[arg(short, long, default_value = "nmidi-server")]
     name: String,
 
-    /// Starting control port (each MIDI port gets a consecutive pair: control + data)
-    #[arg(short = 'p', long, default_value = "5004")]
-    control_port: u16,
-
     /// Bind address
     #[arg(short, long, default_value = "0.0.0.0")]
     bind: String,
@@ -31,6 +28,11 @@ struct Args {
     /// Log level
     #[arg(short, long, default_value = "info")]
     log_level: String,
+}
+
+struct MidiService {
+    _service: Service,
+    _session_handle: tokio::task::JoinHandle<()>,
 }
 
 #[tokio::main]
@@ -51,91 +53,116 @@ async fn main() -> Result<()> {
     tracing::subscriber::set_global_default(subscriber)?;
 
     info!("Starting nmidi-server: {}", args.name);
-    info!("Starting control port: {}", args.control_port);
     info!("Port monitoring interval: {}s", args.monitor_interval);
-
-    // Start MIDI port monitoring
-    let mut port_rx = midi::start_port_monitor(Duration::from_secs(args.monitor_interval)).await;
-    
-    // Wait for initial port detection
-    let initial_ports = port_rx.borrow_and_update().clone();
-    info!(
-        "Initial MIDI ports: {} inputs, {} outputs",
-        initial_ports.inputs.len(),
-        initial_ports.outputs.len()
-    );
 
     // Create service advertiser
     let advertiser = nmidi_core::discovery::ServiceAdvertiser::new()?;
     
-    // Track active services and sessions
-    let mut active_services: HashMap<String, String> = HashMap::new(); // port_key -> service_fullname
+    // Start MIDI port monitoring
+    let mut port_rx = midi::start_port_monitor(Duration::from_secs(args.monitor_interval)).await;
     
-    // Advertise initial ports
-    let mut next_port = args.control_port;
-    for port in initial_ports.all_ports() {
-        let port_key = format!("{}_{}", port.port_type.as_str(), port.index);
-        let service_name = format!("{}_{}", args.name, port_key);
-        
-        let mut properties = HashMap::new();
-        properties.insert("name".to_string(), port.name.clone());
-        properties.insert("ver".to_string(), "2".to_string());
-        properties.insert("type".to_string(), port.port_type.as_str().to_string());
-        properties.insert("index".to_string(), port.index.to_string());
-        
-        match advertiser.advertise_service(&service_name, &args.name, next_port, properties) {
-            Ok(fullname) => {
-                info!(
-                    "Advertising MIDI port '{}' ({:?} #{}) on port {}",
-                    port.name, port.port_type, port.index, next_port
-                );
-                active_services.insert(port_key.clone(), fullname);
-                
-                // Create session manager for this port
-                let session_manager = session::SessionManager::new(
-                    service_name.clone(),
-                    format!("{}:{}", args.bind, next_port),
-                    format!("{}:{}", args.bind, next_port + 1),
-                )
-                .await?;
-                
-                // Spawn session handler
-                let port_name = port.name.clone();
-                tokio::spawn(async move {
-                    if let Err(e) = session_manager.run().await {
-                        warn!("Session manager error for port '{}': {}", port_name, e);
-                    }
-                });
-            }
-            Err(e) => {
-                warn!("Failed to advertise port '{}': {}", port.name, e);
-            }
-        }
-        
-        next_port += 2; // Control port + data port
-    }
-
-    // Monitor for port changes
-    info!("Server started, advertising {} MIDI ports via mDNS", active_services.len());
+    // Track active services by port key
+    let mut active_services: HashMap<String, MidiService> = HashMap::new();
     
     loop {
-        tokio::select! {
-            _ = port_rx.changed() => {
-                let new_ports = port_rx.borrow_and_update().clone();
-                info!(
-                    "MIDI ports changed: {} inputs, {} outputs",
-                    new_ports.inputs.len(),
-                    new_ports.outputs.len()
-                );
+        // Get current ports
+        let current_ports = port_rx.borrow_and_update().clone();
+        
+        // Create set of current port keys
+        let current_keys: std::collections::HashSet<String> = current_ports
+            .all_ports()
+            .iter()
+            .map(|p| format!("{}_{}", p.port_type.as_str(), p.index))
+            .collect();
+        
+        // Remove services for ports that no longer exist
+        active_services.retain(|key, _service| {
+            if !current_keys.contains(key) {
+                info!("Removing service for port: {}", key);
+                false
+            } else {
+                true
+            }
+        });
+        
+        // Add services for new ports
+        for port in current_ports.all_ports() {
+            let port_key = format!("{}_{}", port.port_type.as_str(), port.index);
+            
+            if !active_services.contains_key(&port_key) {
+                let service_name = format!("{}_{}", args.name, port_key);
                 
-                // For now, just log the change
-                // TODO: Implement dynamic service add/remove
-                // This would require:
-                // 1. Computing diff between old and new ports
-                // 2. Unregistering services for removed ports
-                // 3. Advertising services for new ports
-                // 4. Managing session manager lifecycle
+                let mut properties = HashMap::new();
+                properties.insert("name".to_string(), port.name.clone());
+                properties.insert("ver".to_string(), "2".to_string());
+                properties.insert("type".to_string(), port.port_type.as_str().to_string());
+                properties.insert("index".to_string(), port.index.to_string());
+                
+                // Bind to port 0 to let OS assign available ports
+                let control_addr = format!("{}:0", args.bind);
+                let data_addr = format!("{}:0", args.bind);
+                
+                match session::SessionManager::new(
+                    service_name.clone(),
+                    control_addr,
+                    data_addr,
+                )
+                .await
+                {
+                    Ok(session_manager) => {
+                        let control_port = session_manager.control_port();
+                        
+                        match advertiser.advertise_service(
+                            &service_name,
+                            &args.name,
+                            control_port,
+                            properties,
+                        ) {
+                            Ok(service) => {
+                                info!(
+                                    "Advertising MIDI port '{}' ({} #{}) on port {}",
+                                    port.name, port.port_type.as_str(), port.index, control_port
+                                );
+                                
+                                // Spawn session handler
+                                let port_name = port.name.clone();
+                                let session_handle = tokio::spawn(async move {
+                                    if let Err(e) = session_manager.run().await {
+                                        warn!("Session manager error for port '{}': {}", port_name, e);
+                                    }
+                                });
+                                
+                                active_services.insert(
+                                    port_key,
+                                    MidiService {
+                                        _service: service,
+                                        _session_handle: session_handle,
+                                    },
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Failed to advertise port '{}': {}", port.name, e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        warn!("Failed to create session manager for port '{}': {}", port.name, e);
+                    }
+                }
             }
         }
+        
+        if active_services.is_empty() {
+            info!("No MIDI ports available, waiting for ports...");
+        } else {
+            info!("Server advertising {} MIDI ports via mDNS", active_services.len());
+        }
+        
+        // Wait for port changes
+        if port_rx.changed().await.is_err() {
+            break;
+        }
     }
+    
+    Ok(())
 }

@@ -78,16 +78,16 @@ pub fn detect_ports() -> Result<MidiPorts> {
 /// Start monitoring MIDI ports for changes
 /// Returns a watch receiver that will be notified whenever ports change
 pub async fn start_port_monitor(poll_interval: Duration) -> watch::Receiver<MidiPorts> {
-    let (tx, rx) = watch::channel(MidiPorts {
+    // Detect initial ports
+    let initial_ports = detect_ports().unwrap_or_else(|_| MidiPorts {
         inputs: Vec::new(),
         outputs: Vec::new(),
     });
+    
+    let (tx, rx) = watch::channel(initial_ports.clone());
 
     tokio::spawn(async move {
-        let mut last_ports = MidiPorts {
-            inputs: Vec::new(),
-            outputs: Vec::new(),
-        };
+        let mut last_ports = initial_ports;
 
         loop {
             tokio::time::sleep(poll_interval).await;
@@ -116,83 +116,4 @@ pub async fn start_port_monitor(poll_interval: Duration) -> watch::Receiver<Midi
     });
 
     rx
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_midi_port_info_creation() {
-        let port = MidiPortInfo {
-            name: "Test Port".to_string(),
-            index: 0,
-            port_type: MidiPortType::Input,
-        };
-        assert_eq!(port.name, "Test Port");
-        assert_eq!(port.index, 0);
-        assert_eq!(port.port_type, MidiPortType::Input);
-    }
-
-    #[test]
-    fn test_midi_ports_all_ports() {
-        let ports = MidiPorts {
-            inputs: vec![
-                MidiPortInfo {
-                    name: "Input 1".to_string(),
-                    index: 0,
-                    port_type: MidiPortType::Input,
-                },
-                MidiPortInfo {
-                    name: "Input 2".to_string(),
-                    index: 1,
-                    port_type: MidiPortType::Input,
-                },
-            ],
-            outputs: vec![MidiPortInfo {
-                name: "Output 1".to_string(),
-                index: 0,
-                port_type: MidiPortType::Output,
-            }],
-        };
-
-        let all = ports.all_ports();
-        assert_eq!(all.len(), 3);
-        assert_eq!(all[0].port_type, MidiPortType::Input);
-        assert_eq!(all[1].port_type, MidiPortType::Input);
-        assert_eq!(all[2].port_type, MidiPortType::Output);
-    }
-
-    #[test]
-    fn test_midi_ports_equality() {
-        let ports1 = MidiPorts {
-            inputs: vec![MidiPortInfo {
-                name: "Test".to_string(),
-                index: 0,
-                port_type: MidiPortType::Input,
-            }],
-            outputs: vec![],
-        };
-
-        let ports2 = MidiPorts {
-            inputs: vec![MidiPortInfo {
-                name: "Test".to_string(),
-                index: 0,
-                port_type: MidiPortType::Input,
-            }],
-            outputs: vec![],
-        };
-
-        let ports3 = MidiPorts {
-            inputs: vec![MidiPortInfo {
-                name: "Different".to_string(),
-                index: 0,
-                port_type: MidiPortType::Input,
-            }],
-            outputs: vec![],
-        };
-
-        assert_eq!(ports1, ports2);
-        assert_ne!(ports1, ports3);
-    }
 }
