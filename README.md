@@ -21,7 +21,8 @@ This implementation follows the specifications in:
 - RTP-MIDI packet encoding/decoding
 - mDNS-based service discovery (`_apple-midi._udp`)
 - UDP-based transport (control and data channels)
-- Automatic MIDI port detection
+- Automatic MIDI port detection with continuous monitoring
+- **Multi-port advertising**: Each MIDI port gets its own mDNS entry (Apple MIDI compatible)
 - Compatible with macOS Audio MIDI Setup
 - Cross-platform (Linux, macOS, Windows with ALSA/CoreMIDI/WinMM)
 
@@ -57,15 +58,20 @@ Start a server to expose local MIDI ports:
 
 Options:
 - `-n, --name <NAME>`: Device name to advertise (default: "nmidi-server")
-- `-p, --control-port <PORT>`: Control port (default: 5004, data port will be +1)
+- `-p, --control-port <PORT>`: Starting control port - each MIDI port gets consecutive port pairs (default: 5004)
 - `-b, --bind <ADDR>`: Bind address (default: "0.0.0.0")
+- `--monitor-interval <SECONDS>`: Port monitoring interval in seconds (default: 5)
 - `-l, --log-level <LEVEL>`: Log level (trace, debug, info, warn, error)
 
 The server will:
 1. Detect available MIDI input and output ports
-2. Advertise itself via mDNS with service type `_apple-midi._udp`
-3. Listen for incoming connections on the control and data ports
-4. Handle AppleMIDI session handshakes and MIDI data transport
+2. Monitor for port changes in the background
+3. **Advertise each MIDI port via separate mDNS entry** with service type `_apple-midi._udp`
+4. Allocate consecutive UDP port pairs for each MIDI port (control + data)
+5. Listen for incoming connections on all advertised ports
+6. Handle AppleMIDI session handshakes and MIDI data transport
+
+**Multi-Port Advertising**: Following Apple MIDI's approach, each physical MIDI port (input or output) is advertised as a separate mDNS service. This ensures maximum compatibility with Apple Audio MIDI Setup and other RTP-MIDI implementations. Each service includes TXT records with port metadata (name, type, index).
 
 ### Client
 
@@ -108,7 +114,8 @@ The implementation includes:
 
 Uses DNS-SD over mDNS:
 - Service type: `_apple-midi._udp.local.`
-- TXT records: `name=<device>`, `ver=2`
+- **One mDNS entry per MIDI port** for Apple MIDI compatibility
+- TXT records: `name=<port_name>`, `ver=2`, `type=<input|output>`, `index=<port_index>`
 - Automatically discoverable by macOS Audio MIDI Setup
 
 ## Testing
