@@ -110,12 +110,14 @@ impl SessionManager {
             self.midi_input_tx = Some(input_tx.clone());
             
             // Connect to MIDI input port with callback
-            let _connection = midi_in.connect(
+            let connection = midi_in.connect(
                 port,
                 &name,
                 move |_timestamp, message, _| {
                     // Send MIDI message through channel
-                    let _ = input_tx.send(message.to_vec());
+                    if let Err(e) = input_tx.send(message.to_vec()) {
+                        debug!("Failed to send MIDI input to channel: {}", e);
+                    }
                 },
                 (),
             ).map_err(|e| anyhow::anyhow!("Failed to connect to MIDI input: {:?}", e))?;
@@ -156,8 +158,8 @@ impl SessionManager {
                     sequence = sequence.wrapping_add(1);
                 }
                 
-                // Keep connection alive
-                drop(_connection);
+                // Connection is dropped here when the task ends, closing the MIDI input
+                drop(connection);
             }))
         } else {
             None
@@ -212,48 +214,81 @@ impl SessionManager {
             })
         };
 
-        tokio::select! {
-            _ = &mut shutdown_rx => {
-                info!("Shutting down session manager for {}", name);
-                
-                // Send End packets to all peers
-                let sessions_snapshot = {
-                    let sessions_lock = sessions.lock().await;
-                    sessions_lock.clone()
-                };
-
-                for (peer_ssrc, session_state) in sessions_snapshot {
-                    let end_packet = AppleMidiPacket::End {
-                        version: APPLEMIDI_VERSION,
-                        token: session_state.token,
-                        ssrc,
-                    };
+        // Wait for shutdown or task completion
+        if let Some(midi_handle) = midi_input_handle {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!("Shutting down session manager for {}", name);
                     
-                    if let Err(e) = sockets.send_control(&end_packet, &session_state.addr).await {
-                        warn!("Failed to send End packet to peer {}: {}", peer_ssrc, e);
-                    } else {
-                        info!("Sent End packet to peer {}", peer_ssrc);
-                    }
-                }
+                    // Send End packets to all peers
+                    let sessions_snapshot = {
+                        let sessions_lock = sessions.lock().await;
+                        sessions_lock.clone()
+                    };
 
-                // Clear all sessions
-                let mut sessions_lock = sessions.lock().await;
-                sessions_lock.clear();
-            }
-            _ = control_handle => {
-                warn!("Control handler task ended unexpectedly");
-            }
-            _ = data_handle => {
-                warn!("Data handler task ended unexpectedly");
-            }
-            Some(_) = async {
-                if let Some(handle) = midi_input_handle {
-                    handle.await.ok()
-                } else {
-                    None
+                    for (peer_ssrc, session_state) in sessions_snapshot {
+                        let end_packet = AppleMidiPacket::End {
+                            version: APPLEMIDI_VERSION,
+                            token: session_state.token,
+                            ssrc,
+                        };
+                        
+                        if let Err(e) = sockets.send_control(&end_packet, &session_state.addr).await {
+                            warn!("Failed to send End packet to peer {}: {}", peer_ssrc, e);
+                        } else {
+                            info!("Sent End packet to peer {}", peer_ssrc);
+                        }
+                    }
+
+                    // Clear all sessions
+                    let mut sessions_lock = sessions.lock().await;
+                    sessions_lock.clear();
                 }
-            } => {
-                warn!("MIDI input handler task ended unexpectedly");
+                _ = control_handle => {
+                    warn!("Control handler task ended unexpectedly");
+                }
+                _ = data_handle => {
+                    warn!("Data handler task ended unexpectedly");
+                }
+                _ = midi_handle => {
+                    warn!("MIDI input handler task ended unexpectedly");
+                }
+            }
+        } else {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    info!("Shutting down session manager for {}", name);
+                    
+                    // Send End packets to all peers
+                    let sessions_snapshot = {
+                        let sessions_lock = sessions.lock().await;
+                        sessions_lock.clone()
+                    };
+
+                    for (peer_ssrc, session_state) in sessions_snapshot {
+                        let end_packet = AppleMidiPacket::End {
+                            version: APPLEMIDI_VERSION,
+                            token: session_state.token,
+                            ssrc,
+                        };
+                        
+                        if let Err(e) = sockets.send_control(&end_packet, &session_state.addr).await {
+                            warn!("Failed to send End packet to peer {}: {}", peer_ssrc, e);
+                        } else {
+                            info!("Sent End packet to peer {}", peer_ssrc);
+                        }
+                    }
+
+                    // Clear all sessions
+                    let mut sessions_lock = sessions.lock().await;
+                    sessions_lock.clear();
+                }
+                _ = control_handle => {
+                    warn!("Control handler task ended unexpectedly");
+                }
+                _ = data_handle => {
+                    warn!("Data handler task ended unexpectedly");
+                }
             }
         }
 
