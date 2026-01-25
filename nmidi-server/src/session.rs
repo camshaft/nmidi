@@ -10,10 +10,10 @@ use nmidi_core::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION, network::Network
 
 use crate::midi::{MidiPortInfo, MidiPortType};
 
-/// Maximum number of MIDI events to batch into a single RTP packet
-/// This limit helps keep packets within reasonable MTU bounds (~1500 bytes)
-/// Assuming average MIDI message is ~3 bytes, 32 events = ~96 bytes + RTP overhead
-const MAX_BATCH_SIZE: usize = 32;
+/// Maximum RTP packet size to stay within typical MTU bounds
+/// Standard Ethernet MTU is 1500 bytes, minus IP (20) and UDP (8) headers = 1472 bytes
+/// We use 1400 to leave some margin for headers and fragmentation avoidance
+const MAX_PACKET_SIZE: usize = 1400;
 
 #[derive(Debug, Clone)]
 struct SessionState {
@@ -188,7 +188,20 @@ impl SessionManager {
         Ok(tokio::spawn(async move {
             let mut sequence = 0u16;
             
-            while let Some((first_midir_timestamp, first_midi_data)) = input_rx.recv().await {
+            // Overflow buffer for events that didn't fit in the previous packet
+            let mut overflow: Option<(u64, Vec<u8>)> = None;
+            
+            loop {
+                // Get the first event: either from overflow or wait for new event
+                let (first_midir_timestamp, first_midi_data) = if let Some(event) = overflow.take() {
+                    event
+                } else {
+                    match input_rx.recv().await {
+                        Some(event) => event,
+                        None => break, // Channel closed
+                    }
+                };
+                
                 debug!("Received MIDI input: {:?} at midir timestamp {}", first_midi_data, first_midir_timestamp);
                 
                 // Get all connected peers
@@ -210,41 +223,51 @@ impl SessionManager {
                 // Create RTP packet with MIDI data
                 let mut packet = RtpPacket::new(ssrc, sequence, rtp_timestamp);
                 
-                // Collect the first event and any additional queued events for batching
-                let mut events = vec![(first_midir_timestamp, first_midi_data)];
+                // Add first event with delta_time of 0
+                packet.add_command(0, first_midi_data);
+                let mut last_timestamp = first_midir_timestamp;
+                
+                // Calculate initial packet size (RTP header + payload header + first command)
+                // RTP header is 12 bytes, payload flags are 1-2 bytes, plus command data
+                let mut estimated_size = 12 + 2; // RTP header + payload header
+                estimated_size += Self::estimate_command_size(0, &packet.commands[0].data);
+                
+                let mut event_count = 1;
                 
                 // Peek the channel for additional events to batch into the same packet
                 // This optimization reduces network overhead by sending multiple MIDI
                 // commands in a single RTP packet when events are already queued
-                while let Ok((timestamp, data)) = input_rx.try_recv() {
-                    events.push((timestamp, data));
-                    
-                    // Limit batch size to prevent packets from becoming too large
-                    if events.len() >= MAX_BATCH_SIZE {
-                        break;
+                loop {
+                    match input_rx.try_recv() {
+                        Ok((event_timestamp, midi_data)) => {
+                            // Calculate delta time for this event
+                            let delta_time = event_timestamp.saturating_sub(last_timestamp)
+                                .min(u32::MAX as u64) as u32;
+                            
+                            // Estimate size this command would add to the packet
+                            let command_size = Self::estimate_command_size(delta_time, &midi_data);
+                            
+                            // Check if adding this command would exceed MTU
+                            if estimated_size + command_size > MAX_PACKET_SIZE {
+                                // Save this event for the next packet
+                                overflow = Some((event_timestamp, midi_data));
+                                break;
+                            }
+                            
+                            // Add command to packet
+                            packet.add_command(delta_time, midi_data);
+                            estimated_size += command_size;
+                            last_timestamp = event_timestamp;
+                            event_count += 1;
+                        }
+                        Err(_) => {
+                            // No more events queued, send what we have
+                            break;
+                        }
                     }
                 }
                 
-                debug!("Batching {} MIDI events into single packet", events.len());
-                
-                // Add all events to the packet with appropriate delta times
-                let mut last_timestamp = first_midir_timestamp;
-                for (idx, (event_timestamp, midi_data)) in events.into_iter().enumerate() {
-                    // For the first event, use delta_time of 0
-                    // For subsequent events, calculate delta based on timestamp difference
-                    let delta_time = if idx == 0 {
-                        0
-                    } else {
-                        // midir timestamps are platform-specific units. We use them directly 
-                        // as relative deltas between events in the batch. The RTP packet 
-                        // timestamp (already converted to 10kHz) provides the absolute reference.
-                        event_timestamp.saturating_sub(last_timestamp)
-                            .min(u32::MAX as u64) as u32
-                    };
-                    
-                    packet.add_command(delta_time, midi_data);
-                    last_timestamp = event_timestamp;
-                }
+                debug!("Batching {} MIDI events into single packet (estimated {} bytes)", event_count, estimated_size);
                 
                 // Serialize packet once outside the loop
                 let packet_bytes = packet.to_bytes();
@@ -265,6 +288,21 @@ impl SessionManager {
             // Connection is dropped here when the task ends, closing the MIDI input
             drop(connection);
         }))
+    }
+
+    /// Estimate the byte size a MIDI command will add to an RTP packet
+    /// This includes the variable-length delta_time encoding and the MIDI data
+    fn estimate_command_size(delta_time: u32, midi_data: &[u8]) -> usize {
+        // Estimate variable-length encoding of delta_time
+        // Each byte encodes 7 bits, with the high bit indicating continuation
+        let delta_size = if delta_time == 0 {
+            1
+        } else {
+            let mut bits = 32 - delta_time.leading_zeros();
+            ((bits + 6) / 7).max(1) as usize // Round up to nearest 7-bit group
+        };
+        
+        delta_size + midi_data.len()
     }
 
     fn spawn_control_handler(&self) -> tokio::task::JoinHandle<()> {
