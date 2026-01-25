@@ -26,7 +26,6 @@ pub struct SessionManager {
     sockets: Arc<NetworkSockets>,
     sessions: Arc<Mutex<HashMap<u32, SessionState>>>,
     port_info: MidiPortInfo,
-    midi_output_tx: Option<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl SessionManager {
@@ -34,15 +33,12 @@ impl SessionManager {
         let ssrc = generate_ssrc();
         let sockets = NetworkSockets::bind_consecutive(&bind_addr).await?;
         
-        // For output ports, we'll set up the connection and channel in run()
-        // This allows us to spawn the output task alongside input task
         Ok(Self {
             name,
             ssrc,
             sockets: Arc::new(sockets),
             sessions: Arc::new(Mutex::new(HashMap::new())),
             port_info,
-            midi_output_tx: None,
         })
     }
 
@@ -60,181 +56,51 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
-    pub async fn run(mut self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
+    pub async fn run(self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
         let sockets = Arc::clone(&self.sockets);
         let sessions = Arc::clone(&self.sessions);
         let name = self.name.clone();
         let ssrc = self.ssrc;
         let port_type = self.port_info.port_type;
 
-        // Set up MIDI output forwarding if this is an output port
-        let midi_output_handle = if port_type == MidiPortType::Output {
-            let midi_out = MidiOutput::new(&format!("nmidi-server-{}", name))?;
-            let ports = midi_out.ports();
-            
-            if self.port_info.index >= ports.len() {
-                anyhow::bail!("MIDI output port index {} out of range", self.port_info.index);
+        // Create channel for MIDI output forwarding (used by data_handler -> output_task)
+        let (midi_tx, midi_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+
+        // Spawn MIDI task based on port type
+        let midi_task = match port_type {
+            MidiPortType::Output => {
+                Self::spawn_output_task(
+                    &name,
+                    &self.port_info,
+                    midi_rx,
+                ).await?
             }
-            
-            let port = &ports[self.port_info.index];
-            let port_name = self.port_info.name.clone();
-            
-            // Create channel for MIDI output
-            let (output_tx, mut output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-            self.midi_output_tx = Some(output_tx.clone());
-            
-            // Connect to MIDI output port
-            let mut connection = midi_out.connect(port, &name)
-                .map_err(|e| anyhow::anyhow!("Failed to connect to MIDI output: {:?}", e))?;
-            
-            info!("Connected to MIDI output port: {}", port_name);
-            
-            // Spawn task to forward MIDI output to hardware
-            Some(tokio::spawn(async move {
-                while let Some(midi_data) = output_rx.recv().await {
-                    debug!("Forwarding MIDI output: {:?}", midi_data);
-                    
-                    if let Err(e) = connection.send(&midi_data) {
-                        warn!("Failed to send MIDI data to output: {}", e);
-                    }
-                }
-                
-                // Connection is dropped here when the task ends, closing the MIDI output
-                drop(connection);
-            }))
-        } else {
-            None
-        };
-
-        // Set up MIDI input forwarding if this is an input port
-        let midi_input_handle = if port_type == MidiPortType::Input {
-            let midi_in = MidiInput::new(&format!("nmidi-server-{}", name))?;
-            let ports = midi_in.ports();
-            
-            if self.port_info.index >= ports.len() {
-                anyhow::bail!("MIDI input port index {} out of range", self.port_info.index);
+            MidiPortType::Input => {
+                Self::spawn_input_task(
+                    &name,
+                    &self.port_info,
+                    ssrc,
+                    Arc::clone(&sessions),
+                    Arc::clone(&sockets),
+                ).await?
             }
-            
-            let port = &ports[self.port_info.index];
-            let port_name = self.port_info.name.clone();
-            
-            // Create channel for MIDI input (timestamp, data)
-            let (input_tx, mut input_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
-            
-            // Connect to MIDI input port with callback
-            let connection = midi_in.connect(
-                port,
-                &name,
-                move |timestamp, message, _| {
-                    // Capture timestamp immediately when event is received
-                    // Send MIDI message with timestamp through channel
-                    if let Err(e) = input_tx.send((timestamp, message.to_vec())) {
-                        debug!("Failed to send MIDI input to channel: {}", e);
-                    }
-                },
-                (),
-            ).map_err(|e| anyhow::anyhow!("Failed to connect to MIDI input: {:?}", e))?;
-            
-            info!("Connected to MIDI input port: {}", port_name);
-            
-            // Spawn task to forward MIDI input to network
-            let sockets_clone = Arc::clone(&sockets);
-            let sessions_clone = Arc::clone(&sessions);
-            
-            Some(tokio::spawn(async move {
-                let mut sequence = 0u16;
-                
-                while let Some((timestamp, midi_data)) = input_rx.recv().await {
-                    debug!("Received MIDI input: {:?} at timestamp {}", midi_data, timestamp);
-                    
-                    // Get all connected peers
-                    let peers: Vec<SocketAddr> = {
-                        let sessions_lock = sessions_clone.lock().await;
-                        sessions_lock.values().map(|s| s.data_addr).collect()
-                    };
-                    
-                    if peers.is_empty() {
-                        continue;
-                    }
-                    
-                    // Create RTP packet with MIDI data, using captured timestamp
-                    let mut packet = RtpPacket::new(ssrc, sequence, timestamp as u32);
-                    packet.add_command(0, midi_data);
-                    
-                    // Serialize packet once outside the loop
-                    let packet_bytes = packet.to_bytes();
-                    
-                    // Send to all connected peers
-                    for peer_addr in peers {
-                        if let Err(e) = sockets_clone.data.send_to(&packet_bytes, &peer_addr).await {
-                            warn!("Failed to send MIDI data to {}: {}", peer_addr, e);
-                        }
-                    }
-                    
-                    sequence = sequence.wrapping_add(1);
-                }
-                
-                // Connection is dropped here when the task ends, closing the MIDI input
-                drop(connection);
-            }))
-        } else {
-            None
         };
 
-        let control_handle = {
-            let sockets = Arc::clone(&sockets);
-            let sessions = Arc::clone(&sessions);
-            let name = name.clone();
+        let control_handle = Self::spawn_control_handler(
+            Arc::clone(&sockets),
+            Arc::clone(&sessions),
+            name.clone(),
+            ssrc,
+        );
 
-            tokio::spawn(async move {
-                loop {
-                    match sockets.recv_control().await {
-                        Ok((packet, addr)) => {
-                            if let Err(e) = Self::handle_control_packet(
-                                &sockets,
-                                &sessions,
-                                &name,
-                                ssrc,
-                                packet,
-                                addr,
-                            )
-                            .await
-                            {
-                                warn!("Error handling control packet: {}", e);
-                            }
-                        }
-                        Err(e) => warn!("Error receiving control packet: {}", e),
-                    }
-                }
-            })
-        };
-
-        let data_handle = {
-            let sockets = Arc::clone(&sockets);
-            let sessions = Arc::clone(&sessions);
-            let midi_output_tx = self.midi_output_tx.clone();
-
-            tokio::spawn(async move {
-                loop {
-                    match sockets.recv_data().await {
-                        Ok((packet, addr)) => {
-                            if let Err(e) =
-                                Self::handle_data_packet(&sessions, &midi_output_tx, packet, addr).await
-                            {
-                                warn!("Error handling data packet: {}", e);
-                            }
-                        }
-                        Err(e) => warn!("Error receiving data packet: {}", e),
-                    }
-                }
-            })
-        };
+        let data_handle = Self::spawn_data_handler(
+            Arc::clone(&sockets),
+            Arc::clone(&sessions),
+            port_type,
+            midi_tx,
+        );
 
         // Wait for shutdown or task completion
-        // Create optional futures for MIDI handlers
-        let mut midi_output_fut = midi_output_handle;
-        let mut midi_input_fut = midi_input_handle;
-        
         loop {
             tokio::select! {
                 _ = &mut shutdown_rx => {
@@ -249,28 +115,184 @@ impl SessionManager {
                     warn!("Data handler task ended unexpectedly");
                     break;
                 }
-                Some(_) = async {
-                    match &mut midi_output_fut {
-                        Some(handle) => handle.await.ok(),
-                        None => None,
-                    }
-                }, if midi_output_fut.is_some() => {
-                    warn!("MIDI output handler task ended unexpectedly");
-                    break;
-                }
-                Some(_) = async {
-                    match &mut midi_input_fut {
-                        Some(handle) => handle.await.ok(),
-                        None => None,
-                    }
-                }, if midi_input_fut.is_some() => {
-                    warn!("MIDI input handler task ended unexpectedly");
+                _ = midi_task => {
+                    warn!("MIDI handler task ended unexpectedly");
                     break;
                 }
             }
         }
 
         Ok(())
+    }
+
+    async fn spawn_output_task(
+        name: &str,
+        port_info: &MidiPortInfo,
+        mut midi_rx: mpsc::UnboundedReceiver<(u64, Vec<u8>)>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let midi_out = MidiOutput::new(&format!("nmidi-server-{}", name))?;
+        let ports = midi_out.ports();
+        
+        if port_info.index >= ports.len() {
+            anyhow::bail!("MIDI output port index {} out of range", port_info.index);
+        }
+        
+        let port = &ports[port_info.index];
+        let port_name = port_info.name.clone();
+        
+        // Connect to MIDI output port
+        let mut connection = midi_out.connect(port, name)
+            .map_err(|e| anyhow::anyhow!("Failed to connect to MIDI output: {:?}", e))?;
+        
+        info!("Connected to MIDI output port: {}", port_name);
+        
+        // Spawn task to forward MIDI output to hardware
+        let handle = tokio::spawn(async move {
+            // TODO: Implement MIDI scheduler to handle delta_time correctly.
+            // The scheduler should consume timestamped events from the channel
+            // and schedule them for execution at the appropriate time based on delta_time.
+            
+            while let Some((timestamp, midi_data)) = midi_rx.recv().await {
+                debug!("Forwarding MIDI output: {:?} at timestamp {}", midi_data, timestamp);
+                
+                if let Err(e) = connection.send(&midi_data) {
+                    warn!("Failed to send MIDI data to output: {}", e);
+                }
+            }
+            
+            // Connection is dropped here when the task ends, closing the MIDI output
+            drop(connection);
+        });
+        
+        Ok(handle)
+    }
+
+    async fn spawn_input_task(
+        name: &str,
+        port_info: &MidiPortInfo,
+        ssrc: u32,
+        sessions: Arc<Mutex<HashMap<u32, SessionState>>>,
+        sockets: Arc<NetworkSockets>,
+    ) -> Result<tokio::task::JoinHandle<()>> {
+        let midi_in = MidiInput::new(&format!("nmidi-server-{}", name))?;
+        let ports = midi_in.ports();
+        
+        if port_info.index >= ports.len() {
+            anyhow::bail!("MIDI input port index {} out of range", port_info.index);
+        }
+        
+        let port = &ports[port_info.index];
+        let port_name = port_info.name.clone();
+        
+        // Create channel for MIDI input (timestamp, data)
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<(u64, Vec<u8>)>();
+        
+        // Connect to MIDI input port with callback
+        let connection = midi_in.connect(
+            port,
+            name,
+            move |timestamp, message, _| {
+                // Capture timestamp immediately when event is received
+                // Send MIDI message with timestamp through channel
+                if let Err(e) = input_tx.send((timestamp, message.to_vec())) {
+                    debug!("Failed to send MIDI input to channel: {}", e);
+                }
+            },
+            (),
+        ).map_err(|e| anyhow::anyhow!("Failed to connect to MIDI input: {:?}", e))?;
+        
+        info!("Connected to MIDI input port: {}", port_name);
+        
+        // Spawn task to forward MIDI input to network
+        Ok(tokio::spawn(async move {
+            let mut sequence = 0u16;
+            
+            while let Some((timestamp, midi_data)) = input_rx.recv().await {
+                debug!("Received MIDI input: {:?} at timestamp {}", midi_data, timestamp);
+                
+                // Get all connected peers
+                let peers: Vec<SocketAddr> = {
+                    let sessions_lock = sessions.lock().await;
+                    sessions_lock.values().map(|s| s.data_addr).collect()
+                };
+                
+                if peers.is_empty() {
+                    continue;
+                }
+                
+                // Create RTP packet with MIDI data
+                // TODO: Encode timestamp in RTP MIDI's special delta format per RFC 6295
+                let mut packet = RtpPacket::new(ssrc, sequence, timestamp as u32);
+                packet.add_command(0, midi_data);
+                
+                // Serialize packet once outside the loop
+                let packet_bytes = packet.to_bytes();
+                
+                // TODO: Use multicast instead of iterating through every peer
+                // for better performance with many connected clients
+                
+                // Send to all connected peers
+                for peer_addr in peers {
+                    if let Err(e) = sockets.data.send_to(&packet_bytes, &peer_addr).await {
+                        warn!("Failed to send MIDI data to {}: {}", peer_addr, e);
+                    }
+                }
+                
+                sequence = sequence.wrapping_add(1);
+            }
+            
+            // Connection is dropped here when the task ends, closing the MIDI input
+            drop(connection);
+        }))
+    }
+
+    fn spawn_control_handler(
+        sockets: Arc<NetworkSockets>,
+        sessions: Arc<Mutex<HashMap<u32, SessionState>>>,
+        name: String,
+        ssrc: u32,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                match sockets.recv_control().await {
+                    Ok((packet, addr)) => {
+                        if let Err(e) = Self::handle_control_packet(
+                            &sockets,
+                            &sessions,
+                            &name,
+                            ssrc,
+                            packet,
+                            addr,
+                        )
+                        .await
+                        {
+                            warn!("Error handling control packet: {}", e);
+                        }
+                    }
+                    Err(e) => warn!("Error receiving control packet: {}", e),
+                }
+            }
+        })
+    }
+
+    fn spawn_data_handler(
+        sockets: Arc<NetworkSockets>,
+        sessions: Arc<Mutex<HashMap<u32, SessionState>>>,
+        port_type: MidiPortType,
+        midi_tx: mpsc::UnboundedSender<(u64, Vec<u8>)>,
+    ) -> tokio::task::JoinHandle<()> {
+        tokio::spawn(async move {
+            loop {
+                match sockets.recv_data().await {
+                    Ok((packet, addr)) => {
+                        if let Err(e) = Self::handle_data_packet(&sessions, port_type, &midi_tx, packet, addr).await {
+                            warn!("Error handling data packet: {}", e);
+                        }
+                    }
+                    Err(e) => warn!("Error receiving data packet: {}", e),
+                }
+            }
+        })
     }
 
     async fn handle_shutdown(
@@ -408,12 +430,13 @@ impl SessionManager {
 
     async fn handle_data_packet(
         _sessions: &Arc<Mutex<HashMap<u32, SessionState>>>,
-        midi_output_tx: &Option<mpsc::UnboundedSender<Vec<u8>>>,
+        port_type: MidiPortType,
+        midi_tx: &mpsc::UnboundedSender<(u64, Vec<u8>)>,
         packet: RtpPacket,
         _addr: SocketAddr,
     ) -> Result<()> {
-        // Forward MIDI commands to local MIDI output port via channel
-        if let Some(tx) = midi_output_tx {
+        // Only forward to MIDI output ports
+        if port_type == MidiPortType::Output {
             // TODO: Verify all commands should be executed immediately and are not part of
             // the journal/recovery mechanism. Need to handle recovery information correctly
             // to get things on track in case of packet loss (RFC 6295 Section 5)
@@ -423,22 +446,12 @@ impl SessionManager {
                     cmd.delta_time, cmd.data
                 );
                 
-                // TODO: Implement MIDI scheduler to handle delta_time correctly.
-                // Currently all commands are executed immediately, but delta_time
-                // should be used to schedule commands at the correct time.
-                
-                // Send MIDI data to the output channel
-                if let Err(e) = tx.send(cmd.data.clone()) {
+                // Send MIDI data with timestamp to the output channel
+                // The output task will handle scheduling based on delta_time
+                let timestamp = get_timestamp();
+                if let Err(e) = midi_tx.send((timestamp, cmd.data.clone())) {
                     warn!("Failed to send MIDI data to output channel: {}", e);
                 }
-            }
-        } else {
-            // If no MIDI output channel, just log the received data
-            for cmd in &packet.commands {
-                info!(
-                    "MIDI command (no output): delta={}, data={:?}",
-                    cmd.delta_time, cmd.data
-                );
             }
         }
 
