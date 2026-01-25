@@ -2,7 +2,7 @@ use crate::midi::{MidiPortInfo, MidiPortType};
 use anyhow::Result;
 use midir::{MidiInput, MidiOutput};
 use nmidi_core::{
-    APPLEMIDI_VERSION, AppleMidiPacket, RtpPacket,
+    APPLEMIDI_SIGNATURE, APPLEMIDI_VERSION, AppleMidiPacket, RtpPacket,
     network::{MAX_UDP_PAYLOAD, NetworkSockets},
     util::{generate_ssrc, get_timestamp, micros_to_rtp_timestamp},
 };
@@ -42,6 +42,7 @@ impl PartialOrd for ScheduledMidiEvent {
 }
 
 #[derive(Debug, Clone)]
+#[expect(dead_code)]
 struct SessionState {
     ssrc: u32,
     token: u32,
@@ -49,11 +50,19 @@ struct SessionState {
     data_addr: SocketAddr,
     sequence: u16,
     timestamp: u32,
-    /// Time offset in microseconds: peer_time = local_time + offset
+    /// Time offset in RTP ticks (10 kHz, 100us): peer_time = local_time + offset
     /// Calculated from AppleMIDI synchronization packets
-    time_offset: i64,
+    time_offset_ticks: i64,
     /// Last synchronization count received from peer
     last_sync_count: u8,
+    /// Last seen MIDI status byte for running status reconstruction
+    last_status: Option<u8>,
+}
+
+#[derive(Clone, Copy)]
+enum SendOn {
+    Control,
+    Data,
 }
 
 pub struct SessionManager {
@@ -210,20 +219,25 @@ impl SessionManager {
                         let (base_instant, base_timestamp) = base_time.unwrap();
 
                         // Handle timestamp wraparound: if new timestamp is significantly smaller
-                        // than base, assume it wrapped around
-                        let delta_ticks = if rtp_timestamp < base_timestamp
-                            && base_timestamp.wrapping_sub(rtp_timestamp) > (u32::MAX as u64 / 2)
-                        {
-                            // Timestamp wrapped around, calculate correct delta
-                            let ticks_to_max = (u32::MAX as u64).wrapping_sub(base_timestamp);
-                            ticks_to_max.wrapping_add(rtp_timestamp).wrapping_add(1)
+                        // than base, assume it wrapped around. If it's slightly behind (out of order),
+                        // clamp to 0 to avoid giant wrapped deltas.
+                        let delta_ticks = if rtp_timestamp < base_timestamp {
+                            let back_diff = base_timestamp - rtp_timestamp;
+                            if back_diff > (u32::MAX as u64 / 2) {
+                                // Treat as wraparound across u32::MAX
+                                let ticks_to_max = (u32::MAX as u64).wrapping_sub(base_timestamp);
+                                ticks_to_max.wrapping_add(rtp_timestamp).wrapping_add(1)
+                            } else {
+                                // Out-of-order or jitter: execute immediately
+                                0
+                            }
                         } else {
-                            // Normal case: timestamp is ahead or within reasonable delta
-                            rtp_timestamp.wrapping_sub(base_timestamp)
+                            // Normal monotonic case
+                            rtp_timestamp - base_timestamp
                         };
 
-                        // Convert RTP ticks (10kHz = 100us per tick) to microseconds
-                        let delta_micros = delta_ticks * 100;
+                        // Convert RTP ticks (10kHz = 100us per tick) to microseconds safely
+                        let delta_micros = delta_ticks.saturating_mul(100);
 
                         // Calculate absolute execution time
                         let execute_at = base_instant + Duration::from_micros(delta_micros);
@@ -371,37 +385,28 @@ impl SessionManager {
                 // Peek the channel for additional events to batch into the same packet
                 // This optimization reduces network overhead by sending multiple MIDI
                 // commands in a single RTP packet when events are already queued
-                loop {
-                    match input_rx.try_recv() {
-                        Ok((event_timestamp, midi_data)) => {
-                            // Calculate delta time for this event
-                            let delta_time = event_timestamp
-                                .saturating_sub(last_timestamp)
-                                .min(u32::MAX as u64)
-                                as u32;
+                while let Ok((event_timestamp, midi_data)) = input_rx.try_recv() {
+                    // Calculate delta time for this event
+                    let delta_time = event_timestamp
+                        .saturating_sub(last_timestamp)
+                        .min(u32::MAX as u64) as u32;
 
-                            // Estimate size this command would add to the packet
-                            let command_size =
-                                SessionManager::estimate_command_size(delta_time, &midi_data);
+                    // Estimate size this command would add to the packet
+                    let command_size =
+                        SessionManager::estimate_command_size(delta_time, &midi_data);
 
-                            // Check if adding this command would exceed MTU
-                            if estimated_size + command_size > MAX_UDP_PAYLOAD {
-                                // Save this event for the next packet
-                                overflow = Some((event_timestamp, midi_data));
-                                break;
-                            }
-
-                            // Add command to packet
-                            packet.add_command(delta_time, midi_data);
-                            estimated_size += command_size;
-                            last_timestamp = event_timestamp;
-                            event_count += 1;
-                        }
-                        Err(_) => {
-                            // No more events queued, send what we have
-                            break;
-                        }
+                    // Check if adding this command would exceed MTU
+                    if estimated_size + command_size > MAX_UDP_PAYLOAD {
+                        // Save this event for the next packet
+                        overflow = Some((event_timestamp, midi_data));
+                        break;
                     }
+
+                    // Add command to packet
+                    packet.add_command(delta_time, midi_data);
+                    estimated_size += command_size;
+                    last_timestamp = event_timestamp;
+                    event_count += 1;
                 }
 
                 debug!(
@@ -457,7 +462,13 @@ impl SessionManager {
                 match sockets.recv_control().await {
                     Ok((packet, addr)) => {
                         if let Err(e) = Self::handle_control_packet(
-                            &sockets, &sessions, &name, ssrc, packet, addr,
+                            &sockets,
+                            &sessions,
+                            &name,
+                            ssrc,
+                            packet,
+                            addr,
+                            SendOn::Control,
                         )
                         .await
                         {
@@ -477,16 +488,62 @@ impl SessionManager {
         let sockets = Arc::clone(&self.sockets);
         let sessions = Arc::clone(&self.sessions);
         let port_type = self.port_info.port_type;
+        let name = self.name.clone();
+        let ssrc = self.ssrc;
 
         tokio::spawn(async move {
             loop {
-                match sockets.recv_data().await {
-                    Ok((packet, addr)) => {
-                        if let Err(e) =
-                            Self::handle_data_packet(&sessions, port_type, &midi_tx, packet, addr)
+                let mut buf = [0u8; MAX_UDP_PAYLOAD];
+                match sockets.data.recv_from(&mut buf).await {
+                    Ok((len, addr)) => {
+                        // If this looks like an AppleMIDI control packet (signature 0xFFFF),
+                        // handle it as control on the data socket. This is required because
+                        // AppleMIDI sends a second invitation on the data port.
+                        if len >= 2 {
+                            let sig = u16::from_be_bytes([buf[0], buf[1]]);
+                            if sig == APPLEMIDI_SIGNATURE {
+                                match AppleMidiPacket::parse(&buf[..len]) {
+                                    Ok(control_pkt) => {
+                                        if let Err(e) = Self::handle_control_packet(
+                                            &sockets,
+                                            &sessions,
+                                            &name,
+                                            ssrc,
+                                            control_pkt,
+                                            addr,
+                                            SendOn::Data,
+                                        )
+                                        .await
+                                        {
+                                            warn!("Error handling data-port control packet: {}", e);
+                                        }
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "Failed to parse control packet on data socket from {}: {}",
+                                            addr, e
+                                        );
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+
+                        // Otherwise treat as RTP data
+                        match RtpPacket::parse(&buf[..len]) {
+                            Ok(packet) => {
+                                if let Err(e) = Self::handle_data_packet(
+                                    &sessions, port_type, &midi_tx, packet, addr,
+                                )
                                 .await
-                        {
-                            warn!("Error handling data packet: {}", e);
+                                {
+                                    warn!("Error handling data packet: {}", e);
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse data packet from {}: {}", addr, e);
+                            }
                         }
                     }
                     Err(e) => warn!("Error receiving data packet: {}", e),
@@ -537,6 +594,7 @@ impl SessionManager {
         ssrc: u32,
         packet: AppleMidiPacket,
         addr: SocketAddr,
+        send_on: SendOn,
     ) -> Result<()> {
         match packet {
             AppleMidiPacket::Invitation {
@@ -547,44 +605,59 @@ impl SessionManager {
             } => {
                 info!("Received invitation from {} ({})", peer_name, addr);
 
-                // Send acceptance
+                // Send acceptance (protocol version is always 2 per spec)
                 let response = AppleMidiPacket::InvitationAccepted {
                     version: APPLEMIDI_VERSION,
                     token,
                     ssrc,
                     name: name.to_string(),
                 };
-                sockets.send_control(&response, &addr).await?;
+                match send_on {
+                    SendOn::Control => sockets.send_control(&response, &addr).await?,
+                    SendOn::Data => sockets.send_control_on_data(&response, &addr).await?,
+                }
 
-                // Store session - calculate data port safely
-                let data_port = addr.port().checked_add(1).unwrap_or(addr.port());
+                // Store session - derive peer data port. If this invitation arrived
+                // on the control socket, assume data is control+1. If it arrived on
+                // the data socket (Apple’s second-stage invite), use the same port.
+                let data_port = match send_on {
+                    SendOn::Control => addr.port().checked_add(1).unwrap_or(addr.port()),
+                    SendOn::Data => addr.port(),
+                };
                 let data_addr = SocketAddr::new(addr.ip(), data_port);
                 let mut sessions_lock = sessions.lock().await;
-                sessions_lock.insert(
-                    peer_ssrc,
-                    SessionState {
-                        ssrc: peer_ssrc,
-                        token,
-                        addr,
-                        data_addr,
-                        sequence: 0,
-                        timestamp: 0,
-                        time_offset: 0,
-                        last_sync_count: 0,
-                    },
-                );
+                let entry = sessions_lock.entry(peer_ssrc).or_insert(SessionState {
+                    ssrc: peer_ssrc,
+                    token,
+                    addr,
+                    data_addr,
+                    sequence: 0,
+                    timestamp: 0,
+                    time_offset_ticks: 0,
+                    last_sync_count: 0,
+                    last_status: None,
+                });
+
+                // Update address/token if they changed (peer may reinvite with same SSRC)
+                entry.token = token;
+                entry.addr = addr;
+                entry.data_addr = data_addr;
 
                 info!("Session established with {}", peer_name);
 
                 // Send initial synchronization
+                let now_ticks = micros_to_rtp_timestamp(get_timestamp()) as u64;
                 let sync = AppleMidiPacket::Synchronization {
                     ssrc,
                     count: 0,
-                    timestamp1: get_timestamp(),
+                    timestamp1: now_ticks,
                     timestamp2: 0,
                     timestamp3: 0,
                 };
-                sockets.send_control(&sync, &addr).await?;
+                match send_on {
+                    SendOn::Control => sockets.send_control(&sync, &addr).await?,
+                    SendOn::Data => sockets.send_control_on_data(&sync, &addr).await?,
+                }
             }
             AppleMidiPacket::InvitationAccepted {
                 ssrc: peer_ssrc, ..
@@ -607,8 +680,33 @@ impl SessionManager {
             } => {
                 info!("Received sync from SSRC {} (count {})", peer_ssrc, count);
 
-                // Get current time for response
-                let now = get_timestamp();
+                // Get current time for response in RTP ticks (10 kHz)
+                let now_ticks = micros_to_rtp_timestamp(get_timestamp()) as u64;
+
+                // Ensure we have a session entry for this SSRC so we can track time offset
+                {
+                    let mut sessions_lock = sessions.lock().await;
+                    sessions_lock.entry(peer_ssrc).or_insert_with(|| {
+                        // If we don't know the data port, prefer the port we received on
+                        // when handled via data socket; otherwise control+1.
+                        let data_port = match send_on {
+                            SendOn::Control => addr.port().checked_add(1).unwrap_or(addr.port()),
+                            SendOn::Data => addr.port(),
+                        };
+                        let data_addr = SocketAddr::new(addr.ip(), data_port);
+                        SessionState {
+                            ssrc: peer_ssrc,
+                            token: 0,
+                            addr,
+                            data_addr,
+                            sequence: 0,
+                            timestamp: 0,
+                            time_offset_ticks: 0,
+                            last_sync_count: count,
+                            last_status: None,
+                        }
+                    });
+                }
 
                 // Update session with time synchronization info
                 if timestamp2 > 0 {
@@ -620,16 +718,25 @@ impl SessionManager {
                     // now = our current time
 
                     // Round trip time
-                    let rtt = now.saturating_sub(timestamp2);
+                    let rtt = now_ticks.wrapping_sub(timestamp2);
 
                     // Estimated one-way latency (half of RTT)
                     let latency = rtt / 2;
 
                     // Peer's time when we received this response
-                    let peer_time_estimate = timestamp1.saturating_add(latency);
+                    let peer_time_estimate = timestamp1.wrapping_add(latency);
 
                     // Calculate offset: how much to add to local time to get peer time
-                    let time_offset = (peer_time_estimate as i64) - (now as i64);
+                    // Compute signed offset in ticks; wrap-aware within u32 range
+                    let raw_diff = peer_time_estimate.wrapping_sub(now_ticks) as i64;
+                    let wrap = (u32::MAX as i64) + 1;
+                    let time_offset = if raw_diff > wrap / 2 {
+                        raw_diff - wrap
+                    } else if raw_diff < -wrap / 2 {
+                        raw_diff + wrap
+                    } else {
+                        raw_diff
+                    };
 
                     debug!(
                         "Sync from {}: offset={}, rtt={}, latency={}",
@@ -639,7 +746,7 @@ impl SessionManager {
                     // Update session state with synchronization info
                     let mut sessions_lock = sessions.lock().await;
                     if let Some(session) = sessions_lock.get_mut(&peer_ssrc) {
-                        session.time_offset = time_offset;
+                        session.time_offset_ticks = time_offset;
                         session.last_sync_count = count;
                     }
                 } else {
@@ -651,23 +758,43 @@ impl SessionManager {
                     }
                 }
 
-                // Get session address without holding lock
-                let session_addr = {
-                    let sessions_lock = sessions.lock().await;
-                    sessions_lock.get(&peer_ssrc).map(|s| s.addr)
-                };
-
-                // Respond to sync without holding the lock
-                if let Some(addr) = session_addr {
-                    let response = AppleMidiPacket::Synchronization {
+                // Respond per spec: when receiving count 0, set count=1 and stamp
+                // timestamp2 to our receive time; when receiving count 1, set count=2
+                // and stamp timestamp3 to our send time. Ignore higher counts.
+                let maybe_response = match count {
+                    0 => Some(AppleMidiPacket::Synchronization {
                         ssrc,
-                        count: count + 1,
+                        count: 1,
+                        timestamp1,
+                        timestamp2: now_ticks,
+                        timestamp3: now_ticks,
+                    }),
+                    1 => Some(AppleMidiPacket::Synchronization {
+                        ssrc,
+                        count: 2,
                         timestamp1,
                         timestamp2,
-                        timestamp3: now,
-                    };
-                    sockets.send_control(&response, &addr).await?;
+                        timestamp3: now_ticks,
+                    }),
+                    _ => None,
+                };
+
+                if let Some(response) = maybe_response {
+                    match send_on {
+                        SendOn::Control => sockets.send_control(&response, &addr).await?,
+                        SendOn::Data => sockets.send_control_on_data(&response, &addr).await?,
+                    }
                 }
+            }
+            AppleMidiPacket::ReceiverFeedback {
+                ssrc: peer_ssrc,
+                sequence,
+            } => {
+                debug!(
+                    "Received receiver feedback from SSRC {} (sequence {})",
+                    peer_ssrc, sequence
+                );
+                // Currently no recovery journal support; keep session alive but no-op.
             }
         }
 
@@ -687,18 +814,18 @@ impl SessionManager {
             // the journal/recovery mechanism. Need to handle recovery information correctly
             // to get things on track in case of packet loss (RFC 6295 Section 5)
 
-            // Look up the session to get time synchronization info using SSRC from RTP header
-            let time_offset = {
+            // Look up the session to get time synchronization info and running status
+            let (time_offset_ticks, mut last_status) = {
                 let sessions_lock = sessions.lock().await;
                 sessions_lock
                     .get(&packet.header.ssrc)
-                    .map(|s| s.time_offset)
-                    .unwrap_or(0)
+                    .map(|s| (s.time_offset_ticks, s.last_status))
+                    .unwrap_or((0, None))
             };
 
             debug!(
-                "Processing RTP packet from {}, time_offset={}",
-                addr, time_offset
+                "Processing RTP packet {packet:?} from {}, time_offset={}",
+                addr, time_offset_ticks
             );
 
             // Start from the RTP packet timestamp and add each command's delta_time to
@@ -710,30 +837,78 @@ impl SessionManager {
             let rtp_timestamp_micros = (packet.header.timestamp as u64) * 100;
 
             // Apply time offset to convert from peer time to local time
-            // time_offset is in microseconds: peer_time = local_time + offset
+            // time_offset_ticks is in 10kHz ticks: peer_time = local_time + offset
             // Therefore: local_time = peer_time - offset
-            let base_local_micros = if time_offset >= 0 {
-                rtp_timestamp_micros.saturating_sub(time_offset as u64)
+            let time_offset_micros = time_offset_ticks * 100;
+            let base_local_micros = if time_offset_micros >= 0 {
+                rtp_timestamp_micros.saturating_sub(time_offset_micros as u64)
             } else {
-                rtp_timestamp_micros.saturating_add((-time_offset) as u64)
+                rtp_timestamp_micros.saturating_add((-time_offset_micros) as u64)
             };
 
             // Convert back to RTP ticks for internal consistency
             let mut current_timestamp = base_local_micros / 100;
 
             for cmd in &packet.commands {
+                // Reconstruct full MIDI message with running status handling
+                fn required_data_bytes(status: u8) -> Option<usize> {
+                    match status & 0xF0 {
+                        0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => Some(2),
+                        0xC0 | 0xD0 => Some(1),
+                        _ => None,
+                    }
+                }
+
+                // Skip real-time single-byte messages that can appear anywhere
+                if cmd.data.len() == 1 {
+                    let b = cmd.data[0];
+                    if b >= 0xF8 || b == 0xFE {
+                        continue;
+                    }
+                }
+
+                let mut midi_bytes = cmd.data.clone();
+                if midi_bytes.is_empty() {
+                    continue;
+                }
+
+                if midi_bytes[0] < 0x80 {
+                    // Running status: prepend last known status if available
+                    if let Some(status) = last_status {
+                        midi_bytes.insert(0, status);
+                    } else {
+                        // Can't reconstruct, drop
+                        continue;
+                    }
+                }
+
+                // Update running status on valid channel status bytes (exclude system real-time)
+                let status = midi_bytes[0];
+                if status < 0xF0 {
+                    last_status = Some(status);
+                }
+
+                // Validate data length
+                if let Some(needed) = required_data_bytes(status) {
+                    if midi_bytes.len() < 1 + needed {
+                        // Incomplete message, drop
+                        continue;
+                    }
+                    midi_bytes.truncate(1 + needed);
+                }
+
                 // Accumulate delta times to get an absolute scheduled timestamp
                 current_timestamp = current_timestamp.wrapping_add(cmd.delta_time as u64);
 
                 debug!(
                     "Forwarding MIDI command: delta={}, scheduled_ts={}, data={:?}",
-                    cmd.delta_time, current_timestamp, cmd.data
+                    cmd.delta_time, current_timestamp, midi_bytes
                 );
 
                 // Send MIDI data with the computed scheduled timestamp to the output channel.
                 // The output task will schedule playback based on this timestamp.
                 // Use try_send with timeout to avoid blocking if channel is full
-                match midi_tx.try_send((current_timestamp, cmd.data.clone())) {
+                match midi_tx.try_send((current_timestamp, midi_bytes)) {
                     Ok(_) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!("MIDI output channel full, dropping event (backpressure)");
@@ -743,6 +918,12 @@ impl SessionManager {
                         break;
                     }
                 }
+            }
+
+            // Persist updated running status back into the session
+            let mut sessions_lock = sessions.lock().await;
+            if let Some(session) = sessions_lock.get_mut(&packet.header.ssrc) {
+                session.last_status = last_status;
             }
         }
 

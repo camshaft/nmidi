@@ -33,7 +33,6 @@ struct Args {
 struct MidiService {
     _service: Service,
     shutdown_tx: Option<oneshot::Sender<()>>,
-    session_handle: tokio::task::JoinHandle<()>,
 }
 
 impl Drop for MidiService {
@@ -159,7 +158,7 @@ async fn main() -> Result<()> {
 
             // Spawn session handler
             let port_name = port.name.clone();
-            let session_handle = tokio::spawn(async move {
+            tokio::spawn(async move {
                 if let Err(e) = session_manager.run(shutdown_rx).await {
                     warn!("Session manager error for port '{}': {}", port_name, e);
                 }
@@ -170,7 +169,6 @@ async fn main() -> Result<()> {
                 MidiService {
                     _service: service,
                     shutdown_tx: Some(shutdown_tx),
-                    session_handle,
                 },
             );
         }

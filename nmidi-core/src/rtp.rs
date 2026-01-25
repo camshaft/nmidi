@@ -166,73 +166,85 @@ impl RtpPacket {
         let mut commands = Vec::new();
         let mut cursor = Cursor::new(data);
 
-        // Skip flags byte for now (B, J, Z, P flags)
+        // Flags byte (B J Z P)
         let flags = cursor.read_u8()?;
-        let has_journal = (flags >> 7) & 0x01 != 0;
+        let b_flag = (flags & 0x80) != 0;
+        // Per observed Apple packets: Z=0 when first delta is omitted (implicit zero), Z=1 when present
+        let omit_first_delta = (flags & 0x20) == 0;
 
-        // Read length if present (when B flag is set)
-        let b_flag = (flags >> 7) & 0x01 != 0;
-        if !b_flag {
-            // Short header, len is lower 4 bits of flags
-            let _len = flags & 0x0F;
-        } else {
-            // Long header, next byte is length
+        // Determine command section slice based on header form
+        let cmd_slice = if b_flag {
+            // Long header: next byte is length in bytes
             if cursor.position() >= data.len() as u64 {
                 return Ok(commands);
             }
-            let _len = cursor.read_u8()?;
-        }
-
-        // Parse MIDI commands
-        while cursor.position() < data.len() as u64 {
-            // If we have a journal flag and we've parsed some commands,
-            // we might be reaching the journal section.
-            // TODO: Implement proper journal section detection and parsing
-            // per RFC 6295 Section 5 (Recovery Journal).
-            if has_journal && !commands.is_empty() {
-                // Check if remaining data looks like a journal header
-                let remaining = data.len() as u64 - cursor.position();
-                if remaining > 0 && remaining < 100 {
-                    // Likely in journal section, stop parsing MIDI commands
-                    break;
-                }
+            let cmd_len = cursor.read_u8()? as usize;
+            let start = cursor.position() as usize;
+            let end = start.saturating_add(cmd_len).min(data.len());
+            &data[start..end]
+        } else {
+            // Short header: low 4 bits of flags are length in bytes
+            let cmd_len = (flags & 0x0F) as usize;
+            if cmd_len == 0 {
+                return Ok(commands);
             }
+            let start = cursor.position() as usize;
+            let end = start.saturating_add(cmd_len).min(data.len());
+            &data[start..end]
+        };
 
-            // Read delta time (variable length)
-            let delta_time = match Self::read_variable_length(&mut cursor) {
-                Ok(val) => val,
-                Err(_) => break,
+        let mut cmd_cursor = Cursor::new(cmd_slice);
+        let mut first = true;
+
+        while (cmd_cursor.position() as usize) < cmd_slice.len() {
+            let cmd_start = cmd_cursor.position();
+
+            let delta_time = if first && omit_first_delta {
+                0
+            } else {
+                match Self::read_variable_length(&mut cmd_cursor) {
+                    Ok(val) => val,
+                    Err(_) => break,
+                }
             };
 
-            // Read MIDI status byte
-            let status = match cursor.read_u8() {
+            let status = match cmd_cursor.read_u8() {
                 Ok(b) => b,
                 Err(_) => break,
             };
 
-            // Determine command length based on status
-            let mut midi_data = vec![status];
+            // Heuristic: some senders omit the delta even with Z=0. If we see a non-status
+            // byte (<0x80) where status should be, reinterpret as delta=0 and treat that byte as status.
+            let (delta_time, status) = if status < 0x80 {
+                // rewind and re-read as if delta was zero
+                cmd_cursor.set_position(cmd_start);
+                let status = match cmd_cursor.read_u8() {
+                    Ok(b) => b,
+                    Err(_) => break,
+                };
+                (0, status)
+            } else {
+                (delta_time, status)
+            };
 
+            let mut midi_data = vec![status];
             if status >= 0x80 {
-                // Status byte present
                 let data_len = match status & 0xF0 {
-                    0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => 2, // Note Off, Note On, etc. - 2 data bytes
-                    0xC0 | 0xD0 => 1, // Program Change, Channel Pressure - 1 data byte
-                    0xF0 => {
-                        // System messages
-                        match status {
-                            0xF1 | 0xF3 => 1, // MTC Quarter Frame, Song Select
-                            0xF2 => 2,        // Song Position Pointer
-                            _ => 0,           // Other system messages
-                        }
-                    }
+                    0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => 2,
+                    0xC0 | 0xD0 => 1,
+                    0xF0 => match status {
+                        0xF1 | 0xF3 => 1,
+                        0xF2 => 2,
+                        _ => 0,
+                    },
                     _ => 0,
                 };
 
                 for _ in 0..data_len {
-                    match cursor.read_u8() {
-                        Ok(b) => midi_data.push(b),
-                        Err(_) => break,
+                    if let Ok(b) = cmd_cursor.read_u8() {
+                        midi_data.push(b);
+                    } else {
+                        break;
                     }
                 }
             }
@@ -242,10 +254,11 @@ impl RtpPacket {
                 data: midi_data,
             });
 
-            // Simple check to prevent infinite loops on malformed packets
             if commands.len() > MAX_MIDI_COMMANDS_PER_PACKET {
                 break;
             }
+
+            first = false;
         }
 
         Ok(commands)
@@ -292,34 +305,39 @@ impl RtpPacket {
         // Write RTP header
         buf.put(self.header.to_bytes());
 
-        // Write MIDI command section
-        let mut payload = BytesMut::new();
+        // Write MIDI command section using the "B" header form (length-prefixed command list)
+        // to maximize interoperability with Apple's implementation.
+        let mut command_bytes = BytesMut::new();
+        if !self.commands.is_empty() {
+            let first_delta_zero = self
+                .commands
+                .first()
+                .map(|c| c.delta_time == 0)
+                .unwrap_or(false);
 
-        // Flags byte: B flag (no journal for now)
-        let has_journal = false;
-        let b_flag = !self.commands.is_empty();
+            for (idx, cmd) in self.commands.iter().enumerate() {
+                // Per Apple captures: omit the first delta when it is zero and set Z=0 in that case.
+                if !(idx == 0 && first_delta_zero) {
+                    Self::write_variable_length(&mut command_bytes, cmd.delta_time);
+                }
+                command_bytes.put_slice(&cmd.data);
+            }
 
-        if !b_flag {
-            payload.put_u8(0); // No commands
+            // Flags: B=1 always. Set Z=1 only when first delta is present; Z=0 when omitted.
+            let mut flags = 0x80;
+            if !first_delta_zero {
+                flags |= 0x20; // Z: first delta present
+            }
+            // P remains 0 because we always include status bytes.
+
+            buf.put_u8(flags);
+            buf.put_u8(command_bytes.len() as u8); // length of command section in bytes
+            buf.put(command_bytes.freeze());
         } else {
-            // For simplicity, use short header when possible
-            if self.commands.len() <= 15 {
-                let flags = (has_journal as u8) << 7 | (self.commands.len() as u8);
-                payload.put_u8(flags);
-            } else {
-                let flags = 0x80 | ((has_journal as u8) << 7);
-                payload.put_u8(flags);
-                payload.put_u8(self.commands.len() as u8);
-            }
-
-            // Write MIDI commands
-            for cmd in &self.commands {
-                Self::write_variable_length(&mut payload, cmd.delta_time);
-                payload.put_slice(&cmd.data);
-            }
+            // No commands: B=0, len=0
+            buf.put_u8(0);
         }
 
-        buf.put(payload.freeze());
         buf.freeze()
     }
 }
@@ -427,5 +445,85 @@ mod tests {
         // Verify third command
         assert_eq!(parsed.commands[2].delta_time, 5);
         assert_eq!(parsed.commands[2].data, vec![0x80, 0x3C, 0x00]);
+    }
+
+    #[test]
+    fn test_parses_short_header_payload() {
+        // Build a packet with a short (B=0) header form: length in low nibble
+        let mut payload = BytesMut::new();
+        let cmd_bytes = [0x90u8, 0x3C, 0x64];
+        // B=0, len=3, Z=0 (first delta omitted)
+        payload.put_u8(0x03);
+        payload.put_slice(&cmd_bytes);
+
+        let header = RtpHeader {
+            sequence: 1,
+            timestamp: 10,
+            ssrc: 0xAABBCCDD,
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        header.write_to(&mut buf);
+        buf.put(payload);
+
+        let parsed = RtpPacket::parse(&buf.freeze()).unwrap();
+
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(parsed.commands[0].delta_time, 0);
+        assert_eq!(parsed.commands[0].data, vec![0x90, 0x3C, 0x64]);
+    }
+
+    #[test]
+    fn test_parses_short_header_with_z_and_journal() {
+        // Flags: B=0, J=1, Z=1, P=0, length=3 (0b0110_0011 = 0x63)
+        // Command bytes: Note On ch1, C4, vel 0x22. Journal bytes follow and should be ignored.
+        let mut payload = BytesMut::new();
+        payload.put_u8(0x63);
+        payload.put_slice(&[0x90, 0x3C, 0x22]);
+        // Simulate trailing journal bytes (should be ignored by parser)
+        payload.put_slice(&[0x00, 0x00, 0x00, 0x00]);
+
+        let header = RtpHeader {
+            sequence: 1,
+            timestamp: 10,
+            ssrc: 0xAABBCCDD,
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        header.write_to(&mut buf);
+        buf.put(payload);
+
+        let parsed = RtpPacket::parse(&buf.freeze()).unwrap();
+
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(parsed.commands[0].delta_time, 0);
+        assert_eq!(parsed.commands[0].data, vec![0x90, 0x3C, 0x22]);
+    }
+
+    #[test]
+    fn test_parses_short_header_no_delta_even_when_z0() {
+        // Real-world capture: B=0, J=1, Z=0, P=0, len=3, bytes=90 3C 22 (no delta despite Z=0)
+        let mut payload = BytesMut::new();
+        payload.put_u8(0x43);
+        payload.put_slice(&[0x90, 0x3C, 0x22]);
+
+        let header = RtpHeader {
+            sequence: 2,
+            timestamp: 11,
+            ssrc: 0xAABBCCDD,
+            ..Default::default()
+        };
+
+        let mut buf = BytesMut::new();
+        header.write_to(&mut buf);
+        buf.put(payload);
+
+        let parsed = RtpPacket::parse(&buf.freeze()).unwrap();
+
+        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(parsed.commands[0].delta_time, 0);
+        assert_eq!(parsed.commands[0].data, vec![0x90, 0x3C, 0x22]);
     }
 }

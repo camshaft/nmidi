@@ -10,4 +10,4 @@ pub use error::ProtocolError;
 pub use rtp::{MidiCommand, RtpPacket};
 
 pub const APPLEMIDI_SIGNATURE: u16 = 0xFFFF;
-pub const APPLEMIDI_VERSION: u32 = 2;
+pub const APPLEMIDI_VERSION: u16 = 2;

@@ -79,7 +79,26 @@ impl NetworkSockets {
     pub async fn send_control(&self, packet: &AppleMidiPacket, addr: &SocketAddr) -> Result<()> {
         let bytes = packet.to_bytes();
         self.control.send_to(&bytes, addr).await?;
-        debug!("Sent control packet to {}: {:?}", addr, packet);
+        debug!(
+            "Sent control packet to {}: {:?} bytes={:02X?}",
+            addr, packet, bytes
+        );
+        Ok(())
+    }
+
+    /// Send a control packet using the data socket (used for the second stage of the
+    /// AppleMIDI handshake where invitations are repeated on the data port).
+    pub async fn send_control_on_data(
+        &self,
+        packet: &AppleMidiPacket,
+        addr: &SocketAddr,
+    ) -> Result<()> {
+        let bytes = packet.to_bytes();
+        self.data.send_to(&bytes, addr).await?;
+        debug!(
+            "Sent control packet on data socket to {}: {:?} bytes={:02X?}",
+            addr, packet, bytes
+        );
         Ok(())
     }
 

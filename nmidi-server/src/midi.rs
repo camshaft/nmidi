@@ -26,6 +26,14 @@ impl MidiPortType {
     }
 }
 
+fn is_internal_port(name: &str) -> bool {
+    // Ignore ports that belong to this process (or other nmidi tools) to avoid
+    // advertising our own virtual ports. ALSA/macOS may prepend client numbers
+    // (e.g. "Client 72: nmidi-client:0") or use names like "nmidi-server-foo".
+    let lname = name.to_lowercase();
+    lname.contains("nmidi-server") || lname.contains("nmidi-client") || lname.starts_with("nmidi-")
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct MidiPorts {
     pub inputs: Vec<MidiPortInfo>,
@@ -55,10 +63,16 @@ pub fn detect_ports() -> Result<MidiPorts> {
         .iter()
         .enumerate()
         .filter_map(|(idx, port)| {
-            midi_in.port_name(port).ok().map(|name| MidiPortInfo {
-                name,
-                index: idx,
-                port_type: MidiPortType::Input,
+            midi_in.port_name(port).ok().and_then(|name| {
+                if is_internal_port(&name) {
+                    return None;
+                }
+
+                Some(MidiPortInfo {
+                    name,
+                    index: idx,
+                    port_type: MidiPortType::Input,
+                })
             })
         })
         .collect();
@@ -67,10 +81,16 @@ pub fn detect_ports() -> Result<MidiPorts> {
         .iter()
         .enumerate()
         .filter_map(|(idx, port)| {
-            midi_out.port_name(port).ok().map(|name| MidiPortInfo {
-                name,
-                index: idx,
-                port_type: MidiPortType::Output,
+            midi_out.port_name(port).ok().and_then(|name| {
+                if is_internal_port(&name) {
+                    return None;
+                }
+
+                Some(MidiPortInfo {
+                    name,
+                    index: idx,
+                    port_type: MidiPortType::Output,
+                })
             })
         })
         .collect();
@@ -119,4 +139,22 @@ pub async fn start_port_monitor(poll_interval: Duration) -> watch::Receiver<Midi
     });
 
     rx
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_internal_ports() {
+        assert!(is_internal_port("nmidi-server-test:0"));
+        assert!(is_internal_port("Client 72: nmidi-client:0"));
+        assert!(is_internal_port("nmidi-foo"));
+    }
+
+    #[test]
+    fn ignores_external_ports() {
+        assert!(!is_internal_port("Keystation 49e:0"));
+        assert!(!is_internal_port("USB MIDI Interface"));
+    }
 }

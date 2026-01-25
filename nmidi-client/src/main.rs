@@ -91,25 +91,41 @@ async fn main() -> Result<()> {
             let remote_addr: SocketAddr = format!("{}:{}", host, port).parse()?;
             info!("Connecting to {}...", remote_addr);
 
-            // Extract IP address from bind address for data socket
-            let bind_ip = bind.split(':').next().unwrap_or("0.0.0.0");
-            let data_bind = format!("{}:0", bind_ip);
-            let sockets = NetworkSockets::bind(&bind, &data_bind).await?;
+            // AppleMIDI expects the control and data sockets to be on consecutive
+            // ports. Bind a paired socket set on the requested interface.
+            let bind_ip = bind
+                .split(':')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("0.0.0.0");
+            let sockets = NetworkSockets::bind_consecutive(bind_ip).await?;
+
+            let local_control = sockets.control.local_addr()?;
+            let local_data = sockets.data.local_addr()?;
+            info!("Local control {} data {}", local_control, local_data);
 
             // Generate SSRC and token
             let ssrc = generate_ssrc();
             let token = generate_token();
 
-            // Send invitation
+            // Send invitation on control and data sockets (per spec the inviter
+            // repeats the invitation on the data port).
             let invitation = AppleMidiPacket::Invitation {
                 version: APPLEMIDI_VERSION,
                 token,
                 ssrc,
                 name: device_name.clone(),
             };
+            let remote_data_addr = SocketAddr::new(remote_addr.ip(), remote_addr.port() + 1);
 
             sockets.send_control(&invitation, &remote_addr).await?;
-            info!("Sent invitation to {}", remote_addr);
+            sockets
+                .send_control_on_data(&invitation, &remote_data_addr)
+                .await?;
+            info!(
+                "Sent invitation to control {} and data {}",
+                remote_addr, remote_data_addr
+            );
 
             // Wait for response with retry
             // TODO: Implement proper state machine for connection handling
@@ -154,6 +170,9 @@ async fn main() -> Result<()> {
                                 attempts, max_attempts
                             );
                             sockets.send_control(&invitation, &remote_addr).await?;
+                            sockets
+                                .send_control_on_data(&invitation, &remote_data_addr)
+                                .await?;
                         } else {
                             info!("Failed to connect after {} attempts", max_attempts);
                             return Ok(());
