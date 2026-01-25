@@ -231,69 +231,41 @@ impl SessionManager {
         };
 
         // Wait for shutdown or task completion
-        match (midi_output_handle, midi_input_handle) {
-            (Some(output_handle), Some(input_handle)) => {
-                tokio::select! {
-                    _ = &mut shutdown_rx => {
-                        Self::handle_shutdown(&name, ssrc, &sockets, &sessions).await?;
-                    }
-                    _ = control_handle => {
-                        warn!("Control handler task ended unexpectedly");
-                    }
-                    _ = data_handle => {
-                        warn!("Data handler task ended unexpectedly");
-                    }
-                    _ = output_handle => {
-                        warn!("MIDI output handler task ended unexpectedly");
-                    }
-                    _ = input_handle => {
-                        warn!("MIDI input handler task ended unexpectedly");
-                    }
+        // Create optional futures for MIDI handlers
+        let mut midi_output_fut = midi_output_handle;
+        let mut midi_input_fut = midi_input_handle;
+        
+        loop {
+            tokio::select! {
+                _ = &mut shutdown_rx => {
+                    Self::handle_shutdown(&name, ssrc, &sockets, &sessions).await?;
+                    break;
                 }
-            }
-            (Some(output_handle), None) => {
-                tokio::select! {
-                    _ = &mut shutdown_rx => {
-                        Self::handle_shutdown(&name, ssrc, &sockets, &sessions).await?;
-                    }
-                    _ = control_handle => {
-                        warn!("Control handler task ended unexpectedly");
-                    }
-                    _ = data_handle => {
-                        warn!("Data handler task ended unexpectedly");
-                    }
-                    _ = output_handle => {
-                        warn!("MIDI output handler task ended unexpectedly");
-                    }
+                _ = control_handle => {
+                    warn!("Control handler task ended unexpectedly");
+                    break;
                 }
-            }
-            (None, Some(input_handle)) => {
-                tokio::select! {
-                    _ = &mut shutdown_rx => {
-                        Self::handle_shutdown(&name, ssrc, &sockets, &sessions).await?;
-                    }
-                    _ = control_handle => {
-                        warn!("Control handler task ended unexpectedly");
-                    }
-                    _ = data_handle => {
-                        warn!("Data handler task ended unexpectedly");
-                    }
-                    _ = input_handle => {
-                        warn!("MIDI input handler task ended unexpectedly");
-                    }
+                _ = data_handle => {
+                    warn!("Data handler task ended unexpectedly");
+                    break;
                 }
-            }
-            (None, None) => {
-                tokio::select! {
-                    _ = &mut shutdown_rx => {
-                        Self::handle_shutdown(&name, ssrc, &sockets, &sessions).await?;
+                Some(_) = async {
+                    match &mut midi_output_fut {
+                        Some(handle) => handle.await.ok(),
+                        None => None,
                     }
-                    _ = control_handle => {
-                        warn!("Control handler task ended unexpectedly");
+                }, if midi_output_fut.is_some() => {
+                    warn!("MIDI output handler task ended unexpectedly");
+                    break;
+                }
+                Some(_) = async {
+                    match &mut midi_input_fut {
+                        Some(handle) => handle.await.ok(),
+                        None => None,
                     }
-                    _ = data_handle => {
-                        warn!("Data handler task ended unexpectedly");
-                    }
+                }, if midi_input_fut.is_some() => {
+                    warn!("MIDI input handler task ended unexpectedly");
+                    break;
                 }
             }
         }
