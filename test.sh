@@ -20,7 +20,7 @@ head -n 10 /tmp/server.log
 
 echo ""
 echo "Testing client connection..."
-timeout 5 ./target/release/nmidi-client --host 127.0.0.1 --port 5004 --name "TestClient" || true
+timeout 5 ./target/release/nmidi-client connect --host 127.0.0.1 --port 5004 --name "TestClient" || true
 
 echo ""
 echo "Stopping server..."
