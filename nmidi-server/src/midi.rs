@@ -34,16 +34,19 @@ pub struct MidiPorts {
 
 impl MidiPorts {
     pub fn all_ports(&self) -> Vec<MidiPortInfo> {
-        self.inputs.iter().chain(self.outputs.iter()).cloned().collect()
+        self.inputs
+            .iter()
+            .chain(self.outputs.iter())
+            .cloned()
+            .collect()
     }
 }
 
 /// Detect available MIDI ports
 pub fn detect_ports() -> Result<MidiPorts> {
-    let midi_in = MidiInput::new("nmidi-server-detect")
-        .context("Failed to create MIDI input")?;
-    let midi_out = MidiOutput::new("nmidi-server-detect")
-        .context("Failed to create MIDI output")?;
+    let midi_in = MidiInput::new("nmidi-server-detect").context("Failed to create MIDI input")?;
+    let midi_out =
+        MidiOutput::new("nmidi-server-detect").context("Failed to create MIDI output")?;
 
     let input_ports = midi_in.ports();
     let output_ports = midi_out.ports();
@@ -83,7 +86,7 @@ pub async fn start_port_monitor(poll_interval: Duration) -> watch::Receiver<Midi
         inputs: Vec::new(),
         outputs: Vec::new(),
     });
-    
+
     let (tx, rx) = watch::channel(initial_ports.clone());
 
     tokio::spawn(async move {

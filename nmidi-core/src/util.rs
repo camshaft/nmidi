@@ -27,7 +27,7 @@ pub fn get_timestamp() -> u64 {
 }
 
 /// Convert microseconds to RTP MIDI timestamp (10kHz clock)
-/// 
+///
 /// RFC 6295 specifies that RTP MIDI uses a 10kHz clock rate,
 /// meaning each tick is 100 microseconds (0.1 milliseconds).
 /// This function converts microseconds to ticks and wraps to u32.
@@ -54,20 +54,20 @@ mod tests {
     fn test_micros_to_rtp_timestamp() {
         // Test basic conversion: 100 microseconds = 1 tick
         assert_eq!(micros_to_rtp_timestamp(100), 1);
-        
+
         // Test 1 millisecond = 10 ticks (1000 micros / 100)
         assert_eq!(micros_to_rtp_timestamp(1000), 10);
-        
+
         // Test 1 second = 10,000 ticks (1,000,000 micros / 100)
         assert_eq!(micros_to_rtp_timestamp(1_000_000), 10_000);
-        
+
         // Test wrapping: u32::MAX ticks in microseconds should wrap around
         let max_ticks_micros = (u32::MAX as u64) * 100;
         assert_eq!(micros_to_rtp_timestamp(max_ticks_micros), u32::MAX);
-        
+
         // Test wrapping: one more tick should wrap to 0
         assert_eq!(micros_to_rtp_timestamp(max_ticks_micros + 100), 0);
-        
+
         // Test wrapping: two more ticks should wrap to 1
         assert_eq!(micros_to_rtp_timestamp(max_ticks_micros + 200), 1);
     }

@@ -1,12 +1,13 @@
+use crate::{AppleMidiPacket, RtpPacket};
 use anyhow::{Context, Result};
 use std::net::SocketAddr;
 use tokio::net::UdpSocket;
 use tracing::{debug, warn};
 
-use crate::{AppleMidiPacket, RtpPacket};
+/// Maximum UDP payload size for MIDI packets. Most networks should support at least 1200 bytes without fragmentation.
+pub const MAX_UDP_PAYLOAD: usize = 1200;
 
-/// Maximum UDP payload size for MIDI packets (MTU - IP header - UDP header)
-const MAX_UDP_PAYLOAD: usize = 1500;
+const RECV_BUFFER_SIZE: usize = 1500;
 
 pub struct NetworkSockets {
     pub control: UdpSocket,
@@ -38,10 +39,10 @@ impl NetworkSockets {
             let control = UdpSocket::bind(format!("{}:0", bind_addr))
                 .await
                 .context("Failed to bind control socket")?;
-            
+
             let control_port = control.local_addr()?.port();
             let data_port = control_port.wrapping_add(1);
-            
+
             // Try to bind data socket to control_port + 1
             match UdpSocket::bind(format!("{}:{}", bind_addr, data_port)).await {
                 Ok(data) => {
@@ -55,12 +56,12 @@ impl NetworkSockets {
                 }
             }
         }
-        
+
         anyhow::bail!("Failed to bind consecutive ports after 100 attempts")
     }
 
     pub async fn recv_control(&self) -> Result<(AppleMidiPacket, SocketAddr)> {
-        let mut buf = [0u8; MAX_UDP_PAYLOAD];
+        let mut buf = [0u8; RECV_BUFFER_SIZE];
         let (len, addr) = self.control.recv_from(&mut buf).await?;
 
         match AppleMidiPacket::parse(&buf[..len]) {
@@ -75,11 +76,7 @@ impl NetworkSockets {
         }
     }
 
-    pub async fn send_control(
-        &self,
-        packet: &AppleMidiPacket,
-        addr: &SocketAddr,
-    ) -> Result<()> {
+    pub async fn send_control(&self, packet: &AppleMidiPacket, addr: &SocketAddr) -> Result<()> {
         let bytes = packet.to_bytes();
         self.control.send_to(&bytes, addr).await?;
         debug!("Sent control packet to {}: {:?}", addr, packet);
@@ -87,7 +84,7 @@ impl NetworkSockets {
     }
 
     pub async fn recv_data(&self) -> Result<(RtpPacket, SocketAddr)> {
-        let mut buf = [0u8; MAX_UDP_PAYLOAD];
+        let mut buf = [0u8; RECV_BUFFER_SIZE];
         let (len, addr) = self.data.recv_from(&mut buf).await?;
 
         match RtpPacket::parse(&buf[..len]) {

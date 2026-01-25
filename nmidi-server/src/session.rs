@@ -1,21 +1,22 @@
+use crate::midi::{MidiPortInfo, MidiPortType};
 use anyhow::Result;
 use midir::{MidiInput, MidiOutput};
-use std::collections::{HashMap, BinaryHeap};
-use std::cmp::Ordering;
-use std::net::SocketAddr;
-use std::sync::Arc;
-use tokio::sync::{oneshot, Mutex, mpsc};
-use tokio::time::{Duration, Instant};
+use nmidi_core::{
+    APPLEMIDI_VERSION, AppleMidiPacket, RtpPacket,
+    network::{MAX_UDP_PAYLOAD, NetworkSockets},
+    util::{generate_ssrc, get_timestamp, micros_to_rtp_timestamp},
+};
+use std::{
+    cmp::Ordering,
+    collections::{BinaryHeap, HashMap},
+    net::SocketAddr,
+    sync::Arc,
+};
+use tokio::{
+    sync::{Mutex, mpsc, oneshot},
+    time::{Duration, Instant},
+};
 use tracing::{debug, info, warn};
-
-use nmidi_core::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION, network::NetworkSockets, util::{generate_ssrc, get_timestamp, micros_to_rtp_timestamp}};
-
-use crate::midi::{MidiPortInfo, MidiPortType};
-
-/// Maximum RTP packet size to stay within typical MTU bounds
-/// Standard Ethernet MTU is 1500 bytes, minus IP (20) and UDP (8) headers = 1472 bytes
-/// We use 1400 to leave some margin for headers and fragmentation avoidance
-const MAX_PACKET_SIZE: usize = 1400;
 
 /// Scheduled MIDI event for future execution
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -67,7 +68,7 @@ impl SessionManager {
     pub async fn new(name: String, bind_addr: String, port_info: MidiPortInfo) -> Result<Self> {
         let ssrc = generate_ssrc();
         let sockets = NetworkSockets::bind_consecutive(&bind_addr).await?;
-        
+
         Ok(Self {
             name,
             ssrc,
@@ -79,14 +80,18 @@ impl SessionManager {
 
     /// Get the control port the session manager is bound to
     pub fn control_port(&self) -> u16 {
-        self.sockets.control.local_addr()
+        self.sockets
+            .control
+            .local_addr()
             .map(|addr| addr.port())
             .unwrap_or(0)
     }
 
     /// Get the data port the session manager is bound to
     pub fn data_port(&self) -> u16 {
-        self.sockets.data.local_addr()
+        self.sockets
+            .data
+            .local_addr()
             .map(|addr| addr.port())
             .unwrap_or(0)
     }
@@ -98,12 +103,8 @@ impl SessionManager {
 
         // Spawn MIDI task based on port type
         let midi_task = match self.port_info.port_type {
-            MidiPortType::Output => {
-                self.spawn_output_task(midi_rx).await?
-            }
-            MidiPortType::Input => {
-                self.spawn_input_task().await?
-            }
+            MidiPortType::Output => self.spawn_output_task(midi_rx).await?,
+            MidiPortType::Input => self.spawn_input_task().await?,
         };
 
         let control_handle = self.spawn_control_handler();
@@ -131,7 +132,7 @@ impl SessionManager {
 
         // Always run shutdown cleanup regardless of which exit path was taken
         Self::handle_shutdown(&self.name, self.ssrc, &self.sockets, &self.sessions).await?;
-        
+
         result
     }
 
@@ -141,35 +142,39 @@ impl SessionManager {
     ) -> Result<tokio::task::JoinHandle<()>> {
         let midi_out = MidiOutput::new(&format!("nmidi-server-{}", self.name))?;
         let ports = midi_out.ports();
-        
+
         if self.port_info.index >= ports.len() {
-            anyhow::bail!("MIDI output port index {} out of range", self.port_info.index);
+            anyhow::bail!(
+                "MIDI output port index {} out of range",
+                self.port_info.index
+            );
         }
-        
+
         let port = &ports[self.port_info.index];
         let port_name = self.port_info.name.clone();
-        
+
         // Connect to MIDI output port
-        let mut connection = midi_out.connect(port, &self.name)
+        let mut connection = midi_out
+            .connect(port, &self.name)
             .map_err(|e| anyhow::anyhow!("Failed to connect to MIDI output: {:?}", e))?;
-        
+
         info!("Connected to MIDI output port: {}", port_name);
-        
+
         // Spawn task to forward MIDI output to hardware with scheduling
         let handle = tokio::spawn(async move {
             // Priority queue (min-heap) for scheduled events
             let mut scheduled_events = BinaryHeap::new();
-            
+
             // Base time for the scheduler - set when we receive first event
             // Stored as (Instant, RTP timestamp) tuple to keep them synchronized
             let mut base_time: Option<(Instant, u64)> = None;
-            
+
             loop {
                 // Check if we have any events ready to execute
                 let next_event_time: Option<Instant> = scheduled_events
                     .peek()
                     .map(|e: &ScheduledMidiEvent| e.execute_at);
-                
+
                 let timeout_duration: Duration = if let Some(next_time) = next_event_time {
                     // Calculate time until next event
                     let now = Instant::now();
@@ -183,29 +188,32 @@ impl SessionManager {
                     // No scheduled events, wait indefinitely for new ones
                     Duration::from_secs(30) // 30 second timeout as fallback to check for new events
                 };
-                
+
                 // Wait for either a new event or timeout for scheduled event
                 let new_event = tokio::time::timeout(timeout_duration, midi_rx.recv()).await;
-                
+
                 match new_event {
                     Ok(Some((rtp_timestamp, midi_data))) => {
                         // Received a new MIDI event
-                        debug!("Received MIDI event for scheduling: timestamp={}, data={:?}", 
-                               rtp_timestamp, midi_data);
-                        
+                        debug!(
+                            "Received MIDI event for scheduling: timestamp={}, data={:?}",
+                            rtp_timestamp, midi_data
+                        );
+
                         // Initialize base timestamp on first event
                         if base_time.is_none() {
                             base_time = Some((Instant::now(), rtp_timestamp));
                             debug!("Initialized scheduler base: timestamp={}", rtp_timestamp);
                         }
-                        
+
                         // Calculate when to execute this event relative to base time
                         let (base_instant, base_timestamp) = base_time.unwrap();
-                        
+
                         // Handle timestamp wraparound: if new timestamp is significantly smaller
                         // than base, assume it wrapped around
-                        let delta_ticks = if rtp_timestamp < base_timestamp && 
-                                            base_timestamp.wrapping_sub(rtp_timestamp) > (u32::MAX as u64 / 2) {
+                        let delta_ticks = if rtp_timestamp < base_timestamp
+                            && base_timestamp.wrapping_sub(rtp_timestamp) > (u32::MAX as u64 / 2)
+                        {
                             // Timestamp wrapped around, calculate correct delta
                             let ticks_to_max = (u32::MAX as u64).wrapping_sub(base_timestamp);
                             ticks_to_max.wrapping_add(rtp_timestamp).wrapping_add(1)
@@ -213,19 +221,22 @@ impl SessionManager {
                             // Normal case: timestamp is ahead or within reasonable delta
                             rtp_timestamp.wrapping_sub(base_timestamp)
                         };
-                        
+
                         // Convert RTP ticks (10kHz = 100us per tick) to microseconds
-                        let delta_micros = (delta_ticks as u64) * 100;
-                        
+                        let delta_micros = delta_ticks * 100;
+
                         // Calculate absolute execution time
                         let execute_at = base_instant + Duration::from_micros(delta_micros);
-                        
+
                         scheduled_events.push(ScheduledMidiEvent {
                             execute_at,
                             data: midi_data,
                         });
-                        
-                        debug!("Scheduled event for +{} us (delta_ticks={})", delta_micros, delta_ticks);
+
+                        debug!(
+                            "Scheduled event for +{} us (delta_ticks={})",
+                            delta_micros, delta_ticks
+                        );
                     }
                     Ok(None) => {
                         // Channel closed, exit
@@ -236,14 +247,14 @@ impl SessionManager {
                         // Timeout - check for scheduled events to execute
                     }
                 }
-                
+
                 // Execute all events that are due
                 let now = Instant::now();
                 while let Some(event) = scheduled_events.peek() {
                     if event.execute_at <= now {
                         let event = scheduled_events.pop().unwrap();
                         debug!("Executing scheduled MIDI event: {:?}", event.data);
-                        
+
                         if let Err(e) = connection.send(&event.data) {
                             warn!("Failed to send MIDI data to output: {}", e);
                         }
@@ -253,62 +264,66 @@ impl SessionManager {
                     }
                 }
             }
-            
+
             // Connection is dropped here when the task ends, closing the MIDI output
             drop(connection);
         });
-        
+
         Ok(handle)
     }
 
-    async fn spawn_input_task(
-        &self,
-    ) -> Result<tokio::task::JoinHandle<()>> {
+    async fn spawn_input_task(&self) -> Result<tokio::task::JoinHandle<()>> {
         let midi_in = MidiInput::new(&format!("nmidi-server-{}", self.name))?;
         let ports = midi_in.ports();
-        
+
         if self.port_info.index >= ports.len() {
-            anyhow::bail!("MIDI input port index {} out of range", self.port_info.index);
+            anyhow::bail!(
+                "MIDI input port index {} out of range",
+                self.port_info.index
+            );
         }
-        
+
         let port = &ports[self.port_info.index];
         let port_name = self.port_info.name.clone();
-        
+
         // Create channel for MIDI input (timestamp, data)
         // Use bounded channel to prevent unbounded memory growth if network sending is slow
         let (input_tx, mut input_rx) = mpsc::channel::<(u64, Vec<u8>)>(100);
-        
+
         // Connect to MIDI input port with callback
-        let connection = midi_in.connect(
-            port,
-            &self.name,
-            move |timestamp, message, _| {
-                // Capture timestamp immediately when event is received
-                // Send MIDI message with timestamp through channel
-                // Use try_send to avoid blocking the MIDI callback thread
-                if let Err(e) = input_tx.try_send((timestamp, message.to_vec())) {
-                    debug!("Failed to send MIDI input to channel: {}", e);
-                }
-            },
-            (),
-        ).map_err(|e| anyhow::anyhow!("Failed to connect to MIDI input: {:?}", e))?;
-        
+        let connection = midi_in
+            .connect(
+                port,
+                &self.name,
+                move |timestamp, message, _| {
+                    // Capture timestamp immediately when event is received
+                    // Send MIDI message with timestamp through channel
+                    // Use try_send to avoid blocking the MIDI callback thread
+                    if let Err(e) = input_tx.try_send((timestamp, message.to_vec())) {
+                        debug!("Failed to send MIDI input to channel: {}", e);
+                    }
+                },
+                (),
+            )
+            .map_err(|e| anyhow::anyhow!("Failed to connect to MIDI input: {:?}", e))?;
+
         info!("Connected to MIDI input port: {}", port_name);
-        
+
         // Spawn task to forward MIDI input to network
         let sockets = Arc::clone(&self.sockets);
         let sessions = Arc::clone(&self.sessions);
         let ssrc = self.ssrc;
-        
+
         Ok(tokio::spawn(async move {
             let mut sequence = 0u16;
-            
+
             // Overflow buffer for events that didn't fit in the previous packet
             let mut overflow: Option<(u64, Vec<u8>)> = None;
-            
+
             loop {
                 // Get the first event: either from overflow or wait for new event
-                let (first_midir_timestamp, first_midi_data) = if let Some(event) = overflow.take() {
+                let (first_midir_timestamp, first_midi_data) = if let Some(event) = overflow.take()
+                {
                     event
                 } else {
                     match input_rx.recv().await {
@@ -316,39 +331,43 @@ impl SessionManager {
                         None => break, // Channel closed
                     }
                 };
-                
-                debug!("Received MIDI input: {:?} at midir timestamp {}", first_midi_data, first_midir_timestamp);
-                
+
+                debug!(
+                    "Received MIDI input: {:?} at midir timestamp {}",
+                    first_midi_data, first_midir_timestamp
+                );
+
                 // Get all connected peers
                 let peers: Vec<SocketAddr> = {
                     let sessions_lock = sessions.lock().await;
                     sessions_lock.values().map(|s| s.data_addr).collect()
                 };
-                
+
                 if peers.is_empty() {
                     continue;
                 }
-                
+
                 // Convert midir timestamp to our timebase
                 // midir timestamp is in platform-specific units, not directly usable
                 // Get current time in microseconds and convert to RTP MIDI timestamp (10kHz clock rate)
                 let current_micros = get_timestamp();
                 let rtp_timestamp = micros_to_rtp_timestamp(current_micros);
-                
+
                 // Create RTP packet with MIDI data
                 let mut packet = RtpPacket::new(ssrc, sequence, rtp_timestamp);
-                
+
                 // Add first event with delta_time of 0
                 packet.add_command(0, first_midi_data);
                 let mut last_timestamp = first_midir_timestamp;
-                
+
                 // Calculate initial packet size (RTP header + payload header + first command)
                 // RTP header is 12 bytes, payload flags are 1-2 bytes, plus command data
                 let mut estimated_size = 12 + 2; // RTP header + payload header
-                estimated_size += SessionManager::estimate_command_size(0, &packet.commands[0].data);
-                
+                estimated_size +=
+                    SessionManager::estimate_command_size(0, &packet.commands[0].data);
+
                 let mut event_count = 1;
-                
+
                 // Peek the channel for additional events to batch into the same packet
                 // This optimization reduces network overhead by sending multiple MIDI
                 // commands in a single RTP packet when events are already queued
@@ -356,19 +375,22 @@ impl SessionManager {
                     match input_rx.try_recv() {
                         Ok((event_timestamp, midi_data)) => {
                             // Calculate delta time for this event
-                            let delta_time = event_timestamp.saturating_sub(last_timestamp)
-                                .min(u32::MAX as u64) as u32;
-                            
+                            let delta_time = event_timestamp
+                                .saturating_sub(last_timestamp)
+                                .min(u32::MAX as u64)
+                                as u32;
+
                             // Estimate size this command would add to the packet
-                            let command_size = SessionManager::estimate_command_size(delta_time, &midi_data);
-                            
+                            let command_size =
+                                SessionManager::estimate_command_size(delta_time, &midi_data);
+
                             // Check if adding this command would exceed MTU
-                            if estimated_size + command_size > MAX_PACKET_SIZE {
+                            if estimated_size + command_size > MAX_UDP_PAYLOAD {
                                 // Save this event for the next packet
                                 overflow = Some((event_timestamp, midi_data));
                                 break;
                             }
-                            
+
                             // Add command to packet
                             packet.add_command(delta_time, midi_data);
                             estimated_size += command_size;
@@ -381,25 +403,28 @@ impl SessionManager {
                         }
                     }
                 }
-                
-                debug!("Batching {} MIDI events into single packet (estimated {} bytes)", event_count, estimated_size);
-                
+
+                debug!(
+                    "Batching {} MIDI events into single packet (estimated {} bytes)",
+                    event_count, estimated_size
+                );
+
                 // Serialize packet once outside the loop
                 let packet_bytes = packet.to_bytes();
-                
+
                 // TODO: Use multicast instead of iterating through every peer
                 // for better performance with many connected clients
-                
+
                 // Send to all connected peers
                 for peer_addr in peers {
                     if let Err(e) = sockets.data.send_to(&packet_bytes, &peer_addr).await {
                         warn!("Failed to send MIDI data to {}: {}", peer_addr, e);
                     }
                 }
-                
+
                 sequence = sequence.wrapping_add(1);
             }
-            
+
             // Connection is dropped here when the task ends, closing the MIDI input
             drop(connection);
         }))
@@ -415,9 +440,9 @@ impl SessionManager {
             1
         } else {
             let bits = 32 - delta_time.leading_zeros();
-            ((bits + 6) / 7).max(1) as usize // Round up to nearest 7-bit group
+            bits.div_ceil(7).max(1) as usize // Round up to nearest 7-bit group
         };
-        
+
         delta_size + midi_data.len()
     }
 
@@ -426,18 +451,13 @@ impl SessionManager {
         let sessions = Arc::clone(&self.sessions);
         let name = self.name.clone();
         let ssrc = self.ssrc;
-        
+
         tokio::spawn(async move {
             loop {
                 match sockets.recv_control().await {
                     Ok((packet, addr)) => {
                         if let Err(e) = Self::handle_control_packet(
-                            &sockets,
-                            &sessions,
-                            &name,
-                            ssrc,
-                            packet,
-                            addr,
+                            &sockets, &sessions, &name, ssrc, packet, addr,
                         )
                         .await
                         {
@@ -457,12 +477,15 @@ impl SessionManager {
         let sockets = Arc::clone(&self.sockets);
         let sessions = Arc::clone(&self.sessions);
         let port_type = self.port_info.port_type;
-        
+
         tokio::spawn(async move {
             loop {
                 match sockets.recv_data().await {
                     Ok((packet, addr)) => {
-                        if let Err(e) = Self::handle_data_packet(&sessions, port_type, &midi_tx, packet, addr).await {
+                        if let Err(e) =
+                            Self::handle_data_packet(&sessions, port_type, &midi_tx, packet, addr)
+                                .await
+                        {
                             warn!("Error handling data packet: {}", e);
                         }
                     }
@@ -479,7 +502,7 @@ impl SessionManager {
         sessions: &Arc<Mutex<HashMap<u32, SessionState>>>,
     ) -> Result<()> {
         info!("Shutting down session manager for {}", name);
-        
+
         // Send End packets to all peers
         let sessions_snapshot = {
             let sessions_lock = sessions.lock().await;
@@ -492,7 +515,7 @@ impl SessionManager {
                 token: session_state.token,
                 ssrc,
             };
-            
+
             if let Err(e) = sockets.send_control(&end_packet, &session_state.addr).await {
                 warn!("Failed to send End packet to peer {}: {}", peer_ssrc, e);
             } else {
@@ -503,7 +526,7 @@ impl SessionManager {
         // Clear all sessions
         let mut sessions_lock = sessions.lock().await;
         sessions_lock.clear();
-        
+
         Ok(())
     }
 
@@ -586,7 +609,7 @@ impl SessionManager {
 
                 // Get current time for response
                 let now = get_timestamp();
-                
+
                 // Update session with time synchronization info
                 if timestamp2 > 0 {
                     // This is a response to our sync request (count is odd)
@@ -595,24 +618,24 @@ impl SessionManager {
                     // timestamp2 = our receive time (from our original request)
                     // timestamp3 = peer's response time
                     // now = our current time
-                    
+
                     // Round trip time
                     let rtt = now.saturating_sub(timestamp2);
-                    
+
                     // Estimated one-way latency (half of RTT)
                     let latency = rtt / 2;
-                    
+
                     // Peer's time when we received this response
                     let peer_time_estimate = timestamp1.saturating_add(latency);
-                    
+
                     // Calculate offset: how much to add to local time to get peer time
                     let time_offset = (peer_time_estimate as i64) - (now as i64);
-                    
+
                     debug!(
                         "Sync from {}: offset={}, rtt={}, latency={}",
                         peer_ssrc, time_offset, rtt, latency
                     );
-                    
+
                     // Update session state with synchronization info
                     let mut sessions_lock = sessions.lock().await;
                     if let Some(session) = sessions_lock.get_mut(&peer_ssrc) {
@@ -633,7 +656,7 @@ impl SessionManager {
                     let sessions_lock = sessions.lock().await;
                     sessions_lock.get(&peer_ssrc).map(|s| s.addr)
                 };
-                
+
                 // Respond to sync without holding the lock
                 if let Some(addr) = session_addr {
                     let response = AppleMidiPacket::Synchronization {
@@ -663,7 +686,7 @@ impl SessionManager {
             // TODO: Verify all commands should be executed immediately and are not part of
             // the journal/recovery mechanism. Need to handle recovery information correctly
             // to get things on track in case of packet loss (RFC 6295 Section 5)
-            
+
             // Look up the session to get time synchronization info using SSRC from RTP header
             let time_offset = {
                 let sessions_lock = sessions.lock().await;
@@ -672,17 +695,20 @@ impl SessionManager {
                     .map(|s| s.time_offset)
                     .unwrap_or(0)
             };
-            
-            debug!("Processing RTP packet from {}, time_offset={}", addr, time_offset);
-            
+
+            debug!(
+                "Processing RTP packet from {}, time_offset={}",
+                addr, time_offset
+            );
+
             // Start from the RTP packet timestamp and add each command's delta_time to
             // compute a scheduled timestamp for that command.
             // The RTP timestamp is in the peer's timebase (10kHz clock).
             // Convert it to our local timebase using the time offset.
-            
+
             // RTP timestamp is in 10kHz ticks (100us per tick)
             let rtp_timestamp_micros = (packet.header.timestamp as u64) * 100;
-            
+
             // Apply time offset to convert from peer time to local time
             // time_offset is in microseconds: peer_time = local_time + offset
             // Therefore: local_time = peer_time - offset
@@ -691,26 +717,24 @@ impl SessionManager {
             } else {
                 rtp_timestamp_micros.saturating_add((-time_offset) as u64)
             };
-            
+
             // Convert back to RTP ticks for internal consistency
             let mut current_timestamp = base_local_micros / 100;
-            
+
             for cmd in &packet.commands {
                 // Accumulate delta times to get an absolute scheduled timestamp
                 current_timestamp = current_timestamp.wrapping_add(cmd.delta_time as u64);
-                
+
                 debug!(
                     "Forwarding MIDI command: delta={}, scheduled_ts={}, data={:?}",
-                    cmd.delta_time,
-                    current_timestamp,
-                    cmd.data
+                    cmd.delta_time, current_timestamp, cmd.data
                 );
-                
+
                 // Send MIDI data with the computed scheduled timestamp to the output channel.
                 // The output task will schedule playback based on this timestamp.
                 // Use try_send with timeout to avoid blocking if channel is full
                 match midi_tx.try_send((current_timestamp, cmd.data.clone())) {
-                    Ok(_) => {},
+                    Ok(_) => {}
                     Err(mpsc::error::TrySendError::Full(_)) => {
                         warn!("MIDI output channel full, dropping event (backpressure)");
                     }
@@ -767,11 +791,11 @@ mod tests {
         let our_receive_time = 9000u64; // timestamp2 (we're behind)
         let rtt = 200u64;
         let latency = rtt / 2;
-        
+
         let peer_time_estimate = peer_send_time.saturating_add(latency);
         let our_current_time = our_receive_time + rtt;
         let time_offset = (peer_time_estimate as i64) - (our_current_time as i64);
-        
+
         // peer_time_estimate = 10000 + 100 = 10100
         // our_current_time = 9000 + 200 = 9200
         // time_offset = 10100 - 9200 = 900
@@ -783,16 +807,16 @@ mod tests {
         // Test wraparound detection logic for u32 RTP timestamps
         let base_timestamp: u64 = 4294967200; // Near u32::MAX
         let new_timestamp: u64 = 100; // After wraparound
-        
+
         // Check if this looks like a wraparound
-        let is_wraparound = new_timestamp < base_timestamp && 
-                           base_timestamp.wrapping_sub(new_timestamp) > (u32::MAX as u64 / 2);
+        let is_wraparound = new_timestamp < base_timestamp
+            && base_timestamp.wrapping_sub(new_timestamp) > (u32::MAX as u64 / 2);
         assert!(is_wraparound);
-        
+
         // Calculate correct delta for wraparound case
         let ticks_to_max = (u32::MAX as u64).wrapping_sub(base_timestamp);
         let delta_ticks = ticks_to_max.wrapping_add(new_timestamp).wrapping_add(1);
-        
+
         // Should be: (u32::MAX - 4294967200) + 100 + 1 = 95 + 100 + 1 = 196
         // u32::MAX = 4294967295
         // ticks_to_max = 4294967295 - 4294967200 = 95

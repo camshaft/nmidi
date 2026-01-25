@@ -1,9 +1,7 @@
-use bytes::{BufMut, Bytes, BytesMut};
+use crate::{APPLEMIDI_SIGNATURE, error::ProtocolError};
 use byteorder::{BigEndian, ReadBytesExt};
+use bytes::{BufMut, Bytes, BytesMut};
 use std::io::{Cursor, Read};
-
-use crate::error::ProtocolError;
-use crate::APPLEMIDI_SIGNATURE;
 
 /// AppleMIDI protocol commands (4 bytes)
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,11 +68,7 @@ pub enum AppleMidiPacket {
         name: String,
     },
     /// End session packet
-    End {
-        version: u32,
-        token: u32,
-        ssrc: u32,
-    },
+    End { version: u32, token: u32, ssrc: u32 },
     /// Synchronization packet
     Synchronization {
         ssrc: u32,
@@ -190,11 +184,9 @@ impl AppleMidiPacket {
                     timestamp3,
                 })
             }
-            AppleMidiCommand::ReceiverFeedback => {
-                Err(ProtocolError::InvalidCommand(
-                    "ReceiverFeedback not yet implemented".to_string(),
-                ))
-            }
+            AppleMidiCommand::ReceiverFeedback => Err(ProtocolError::InvalidCommand(
+                "ReceiverFeedback not yet implemented".to_string(),
+            )),
         }
     }
 

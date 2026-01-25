@@ -1,7 +1,6 @@
 use anyhow::{Context, Result};
 use mdns_sd::{ServiceDaemon, ServiceInfo};
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 use tracing::warn;
 
 const SERVICE_TYPE: &str = "_apple-midi._udp.local.";
@@ -15,7 +14,9 @@ impl ServiceAdvertiser {
     /// Create a new service advertiser
     pub fn new() -> Result<Self> {
         let mdns = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
-        Ok(Self { mdns: Arc::new(mdns) })
+        Ok(Self {
+            mdns: Arc::new(mdns),
+        })
     }
 
     /// Advertise a MIDI service via mDNS
@@ -28,7 +29,7 @@ impl ServiceAdvertiser {
         properties: HashMap<String, String>,
     ) -> Result<Service> {
         let hostname = format!("{}.local.", device_name);
-        
+
         let service_info = ServiceInfo::new(
             SERVICE_TYPE,
             service_name,
@@ -40,7 +41,7 @@ impl ServiceAdvertiser {
         .context("Failed to create service info")?;
 
         let fullname = service_info.get_fullname().to_string();
-        
+
         self.mdns
             .register(service_info)
             .context("Failed to register mDNS service")?;
@@ -67,10 +68,7 @@ impl Drop for Service {
 }
 
 /// Advertise MIDI service via mDNS (legacy single-service function)
-pub fn advertise_service(
-    device_name: &str,
-    control_port: u16,
-) -> Result<ServiceDaemon> {
+pub fn advertise_service(device_name: &str, control_port: u16) -> Result<ServiceDaemon> {
     let mdns = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
 
     // Create TXT records
@@ -99,6 +97,8 @@ pub fn advertise_service(
 /// Browse for MIDI services on the network
 pub fn browse_services() -> Result<mdns_sd::Receiver<mdns_sd::ServiceEvent>> {
     let mdns = ServiceDaemon::new().context("Failed to create mDNS daemon")?;
-    let receiver = mdns.browse(SERVICE_TYPE).context("Failed to browse for services")?;
+    let receiver = mdns
+        .browse(SERVICE_TYPE)
+        .context("Failed to browse for services")?;
     Ok(receiver)
 }

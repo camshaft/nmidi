@@ -1,10 +1,13 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use nmidi_core::{
+    APPLEMIDI_VERSION, AppleMidiPacket, discovery,
+    network::NetworkSockets,
+    util::{generate_ssrc, generate_token, get_hostname},
+};
 use std::net::SocketAddr;
-use tracing::{info, Level};
+use tracing::{Level, info};
 use tracing_subscriber::FmtSubscriber;
-
-use nmidi_core::{AppleMidiPacket, APPLEMIDI_VERSION, discovery, network::NetworkSockets, util::{generate_ssrc, generate_token, get_hostname}};
 
 #[derive(Parser, Debug)]
 #[command(name = "nmidi-client")]
@@ -76,10 +79,15 @@ async fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Connect { host, port, name, bind } => {
+        Commands::Connect {
+            host,
+            port,
+            name,
+            bind,
+        } => {
             let device_name = name.unwrap_or_else(get_hostname);
             info!("Starting nmidi-client: {}", device_name);
-            
+
             let remote_addr: SocketAddr = format!("{}:{}", host, port).parse()?;
             info!("Connecting to {}...", remote_addr);
 
@@ -109,12 +117,14 @@ async fn main() -> Result<()> {
             // to handle protocol events more robustly
             let mut attempts = 0;
             let max_attempts = 3;
-            
+
             while attempts < max_attempts {
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    sockets.recv_control()
-                ).await {
+                    sockets.recv_control(),
+                )
+                .await
+                {
                     Ok(Ok((packet, addr))) => {
                         info!("Received control packet from {}: {:?}", addr, packet);
 
@@ -139,7 +149,10 @@ async fn main() -> Result<()> {
                     Err(_) => {
                         attempts += 1;
                         if attempts < max_attempts {
-                            info!("Timeout waiting for response, retrying... (attempt {}/{})", attempts, max_attempts);
+                            info!(
+                                "Timeout waiting for response, retrying... (attempt {}/{})",
+                                attempts, max_attempts
+                            );
                             sockets.send_control(&invitation, &remote_addr).await?;
                         } else {
                             info!("Failed to connect after {} attempts", max_attempts);
@@ -156,4 +169,3 @@ async fn main() -> Result<()> {
 
     Ok(())
 }
-

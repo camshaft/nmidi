@@ -1,8 +1,7 @@
-use bytes::{BufMut, Bytes, BytesMut};
-use byteorder::{BigEndian, ReadBytesExt};
-use std::io::Cursor;
-
 use crate::error::ProtocolError;
+use byteorder::{BigEndian, ReadBytesExt};
+use bytes::{BufMut, Bytes, BytesMut};
+use std::io::Cursor;
 
 /// Maximum number of MIDI commands per RTP packet to prevent infinite loops
 /// during parsing of malformed packets
@@ -218,7 +217,7 @@ impl RtpPacket {
                 // Status byte present
                 let data_len = match status & 0xF0 {
                     0x80 | 0x90 | 0xA0 | 0xB0 | 0xE0 => 2, // Note Off, Note On, etc. - 2 data bytes
-                    0xC0 | 0xD0 => 1,                       // Program Change, Channel Pressure - 1 data byte
+                    0xC0 | 0xD0 => 1, // Program Change, Channel Pressure - 1 data byte
                     0xF0 => {
                         // System messages
                         match status {
@@ -298,7 +297,7 @@ impl RtpPacket {
 
         // Flags byte: B flag (no journal for now)
         let has_journal = false;
-        let b_flag = self.commands.len() > 0;
+        let b_flag = !self.commands.is_empty();
 
         if !b_flag {
             payload.put_u8(0); // No commands
@@ -379,20 +378,20 @@ mod tests {
         };
 
         let bytes = header.to_bytes();
-        
+
         // Check the header is 12 bytes
         assert_eq!(bytes.len(), 12);
-        
+
         // Verify byte order for sequence (bytes 2-3)
         assert_eq!(bytes[2], 0x12);
         assert_eq!(bytes[3], 0x34);
-        
+
         // Verify byte order for timestamp (bytes 4-7)
         assert_eq!(bytes[4], 0x12);
         assert_eq!(bytes[5], 0x34);
         assert_eq!(bytes[6], 0x56);
         assert_eq!(bytes[7], 0x78);
-        
+
         // Verify byte order for ssrc (bytes 8-11)
         assert_eq!(bytes[8], 0x9A);
         assert_eq!(bytes[9], 0xBC);
@@ -404,27 +403,27 @@ mod tests {
     fn test_rtp_packet_batching_multiple_commands() {
         // Test batching multiple MIDI commands in a single RTP packet
         let mut packet = RtpPacket::new(12345, 100, 1000);
-        
+
         // Add multiple MIDI commands with delta times
         packet.add_command(0, vec![0x90, 0x3C, 0x64]); // Note On, delta_time=0
         packet.add_command(10, vec![0x90, 0x3E, 0x64]); // Note On, delta_time=10
         packet.add_command(5, vec![0x80, 0x3C, 0x00]); // Note Off, delta_time=5
-        
+
         // Serialize and parse
         let bytes = packet.to_bytes();
         let parsed = RtpPacket::parse(&bytes).unwrap();
-        
+
         // Verify all commands are preserved
         assert_eq!(parsed.commands.len(), 3);
-        
+
         // Verify first command
         assert_eq!(parsed.commands[0].delta_time, 0);
         assert_eq!(parsed.commands[0].data, vec![0x90, 0x3C, 0x64]);
-        
+
         // Verify second command
         assert_eq!(parsed.commands[1].delta_time, 10);
         assert_eq!(parsed.commands[1].data, vec![0x90, 0x3E, 0x64]);
-        
+
         // Verify third command
         assert_eq!(parsed.commands[2].delta_time, 5);
         assert_eq!(parsed.commands[2].data, vec![0x80, 0x3C, 0x00]);
