@@ -6,6 +6,7 @@ use clap::Parser;
 use nmidi_core::discovery::Service;
 use std::collections::HashMap;
 use std::time::Duration;
+use tokio::sync::oneshot;
 use tracing::{info, warn, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -32,7 +33,19 @@ struct Args {
 
 struct MidiService {
     _service: Service,
-    _session_handle: tokio::task::JoinHandle<()>,
+    shutdown_tx: Option<oneshot::Sender<()>>,
+    session_handle: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MidiService {
+    fn drop(&mut self) {
+        // Send shutdown signal to gracefully close sessions
+        if let Some(tx) = self.shutdown_tx.take() {
+            let _ = tx.send(());
+        }
+        // Abort the task if it's still running
+        self.session_handle.abort();
+    }
 }
 
 #[tokio::main]
@@ -124,10 +137,13 @@ async fn main() -> Result<()> {
                                     port.name, port.port_type.as_str(), port.index, control_port
                                 );
                                 
+                                // Create shutdown channel
+                                let (shutdown_tx, shutdown_rx) = oneshot::channel();
+                                
                                 // Spawn session handler
                                 let port_name = port.name.clone();
                                 let session_handle = tokio::spawn(async move {
-                                    if let Err(e) = session_manager.run().await {
+                                    if let Err(e) = session_manager.run(shutdown_rx).await {
                                         warn!("Session manager error for port '{}': {}", port_name, e);
                                     }
                                 });
@@ -136,7 +152,8 @@ async fn main() -> Result<()> {
                                     port_key,
                                     MidiService {
                                         _service: service,
-                                        _session_handle: session_handle,
+                                        shutdown_tx: Some(shutdown_tx),
+                                        session_handle,
                                     },
                                 );
                             }

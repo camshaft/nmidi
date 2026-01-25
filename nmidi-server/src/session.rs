@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tracing::{info, warn};
 
 use nmidi_core::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION, network::NetworkSockets, util::{generate_ssrc, get_timestamp}};
@@ -43,7 +43,7 @@ impl SessionManager {
             .unwrap_or(0)
     }
 
-    pub async fn run(&self) -> Result<()> {
+    pub async fn run(self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
         let control_handle = {
             let sockets = Arc::clone(&self.sockets);
             let sessions = Arc::clone(&self.sessions);
@@ -96,9 +96,39 @@ impl SessionManager {
         tokio::select! {
             _ = control_handle => {},
             _ = data_handle => {},
+            _ = &mut shutdown_rx => {
+                info!("Shutting down session manager for {}", self.name);
+                self.shutdown_sessions().await;
+            }
         }
 
         Ok(())
+    }
+
+    /// Gracefully shutdown all active sessions
+    async fn shutdown_sessions(&self) {
+        let sessions = {
+            let sessions_lock = self.sessions.lock().await;
+            sessions_lock.clone()
+        };
+
+        for (peer_ssrc, session_state) in sessions {
+            let end_packet = AppleMidiPacket::End {
+                version: APPLEMIDI_VERSION,
+                token: session_state.token,
+                ssrc: self.ssrc,
+            };
+            
+            if let Err(e) = self.sockets.send_control(&end_packet, &session_state.addr).await {
+                warn!("Failed to send End packet to peer {}: {}", peer_ssrc, e);
+            } else {
+                info!("Sent End packet to peer {}", peer_ssrc);
+            }
+        }
+
+        // Clear all sessions
+        let mut sessions_lock = self.sessions.lock().await;
+        sessions_lock.clear();
     }
 
     async fn handle_control_packet(
