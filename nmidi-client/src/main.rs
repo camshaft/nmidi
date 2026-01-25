@@ -1,9 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use midir::{MidiInput, MidiOutput};
-#[cfg(target_os = "linux")]
-use midir::os::unix::{VirtualInput, VirtualOutput};
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 use midir::os::unix::{VirtualInput, VirtualOutput};
 use nmidi_core::{
     APPLEMIDI_SIGNATURE, APPLEMIDI_VERSION, AppleMidiPacket, RtpPacket, discovery,
@@ -315,7 +313,7 @@ fn spawn_virtual_output_task(
             }
         }
         
-        // Keep connection alive
+        // Connection is dropped here when task ends
         drop(_connection);
     }))
 }
