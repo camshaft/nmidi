@@ -29,6 +29,36 @@ impl NetworkSockets {
         Ok(Self { control, data })
     }
 
+    /// Bind to consecutive ports (control port and control_port + 1 for data)
+    /// This is required for Apple MIDI compatibility
+    pub async fn bind_consecutive(bind_addr: &str) -> Result<Self> {
+        // Try up to 100 times to find consecutive ports
+        for _ in 0..100 {
+            // Bind to a random port for control
+            let control = UdpSocket::bind(format!("{}:0", bind_addr))
+                .await
+                .context("Failed to bind control socket")?;
+            
+            let control_port = control.local_addr()?.port();
+            let data_port = control_port.wrapping_add(1);
+            
+            // Try to bind data socket to control_port + 1
+            match UdpSocket::bind(format!("{}:{}", bind_addr, data_port)).await {
+                Ok(data) => {
+                    debug!("Control socket bound to: {}", control.local_addr()?);
+                    debug!("Data socket bound to: {}", data.local_addr()?);
+                    return Ok(Self { control, data });
+                }
+                Err(_) => {
+                    // Port already in use, try again
+                    continue;
+                }
+            }
+        }
+        
+        anyhow::bail!("Failed to bind consecutive ports after 100 attempts")
+    }
+
     pub async fn recv_control(&self) -> Result<(AppleMidiPacket, SocketAddr)> {
         let mut buf = [0u8; MAX_UDP_PAYLOAD];
         let (len, addr) = self.control.recv_from(&mut buf).await?;

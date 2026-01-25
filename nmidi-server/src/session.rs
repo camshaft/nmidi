@@ -2,7 +2,7 @@ use anyhow::Result;
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use tokio::sync::{oneshot, Mutex};
 use tracing::{info, warn};
 
 use nmidi_core::{AppleMidiPacket, RtpPacket, APPLEMIDI_VERSION, network::NetworkSockets, util::{generate_ssrc, get_timestamp}};
@@ -25,9 +25,9 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub async fn new(name: String, control_addr: String, data_addr: String) -> Result<Self> {
+    pub async fn new(name: String, bind_addr: String) -> Result<Self> {
         let ssrc = generate_ssrc();
-        let sockets = NetworkSockets::bind(&control_addr, &data_addr).await?;
+        let sockets = NetworkSockets::bind_consecutive(&bind_addr).await?;
         Ok(Self {
             name,
             ssrc,
@@ -36,12 +36,30 @@ impl SessionManager {
         })
     }
 
-    pub async fn run(&self) -> Result<()> {
+    /// Get the control port the session manager is bound to
+    pub fn control_port(&self) -> u16 {
+        self.sockets.control.local_addr()
+            .map(|addr| addr.port())
+            .unwrap_or(0)
+    }
+
+    /// Get the data port the session manager is bound to
+    pub fn data_port(&self) -> u16 {
+        self.sockets.data.local_addr()
+            .map(|addr| addr.port())
+            .unwrap_or(0)
+    }
+
+    pub async fn run(self, mut shutdown_rx: oneshot::Receiver<()>) -> Result<()> {
+        let sockets = Arc::clone(&self.sockets);
+        let sessions = Arc::clone(&self.sessions);
+        let name = self.name.clone();
+        let ssrc = self.ssrc;
+
         let control_handle = {
-            let sockets = Arc::clone(&self.sockets);
-            let sessions = Arc::clone(&self.sessions);
-            let name = self.name.clone();
-            let ssrc = self.ssrc;
+            let sockets = Arc::clone(&sockets);
+            let sessions = Arc::clone(&sessions);
+            let name = name.clone();
 
             tokio::spawn(async move {
                 loop {
@@ -67,8 +85,8 @@ impl SessionManager {
         };
 
         let data_handle = {
-            let sockets = Arc::clone(&self.sockets);
-            let sessions = Arc::clone(&self.sessions);
+            let sockets = Arc::clone(&sockets);
+            let sessions = Arc::clone(&sessions);
 
             tokio::spawn(async move {
                 loop {
@@ -87,8 +105,39 @@ impl SessionManager {
         };
 
         tokio::select! {
-            _ = control_handle => {},
-            _ = data_handle => {},
+            _ = &mut shutdown_rx => {
+                info!("Shutting down session manager for {}", name);
+                
+                // Send End packets to all peers
+                let sessions_snapshot = {
+                    let sessions_lock = sessions.lock().await;
+                    sessions_lock.clone()
+                };
+
+                for (peer_ssrc, session_state) in sessions_snapshot {
+                    let end_packet = AppleMidiPacket::End {
+                        version: APPLEMIDI_VERSION,
+                        token: session_state.token,
+                        ssrc,
+                    };
+                    
+                    if let Err(e) = sockets.send_control(&end_packet, &session_state.addr).await {
+                        warn!("Failed to send End packet to peer {}: {}", peer_ssrc, e);
+                    } else {
+                        info!("Sent End packet to peer {}", peer_ssrc);
+                    }
+                }
+
+                // Clear all sessions
+                let mut sessions_lock = sessions.lock().await;
+                sessions_lock.clear();
+            }
+            _ = control_handle => {
+                warn!("Control handler task ended unexpectedly");
+            }
+            _ = data_handle => {
+                warn!("Data handler task ended unexpectedly");
+            }
         }
 
         Ok(())
