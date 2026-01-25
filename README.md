@@ -58,7 +58,6 @@ Start a server to expose local MIDI ports:
 
 Options:
 - `-n, --name <NAME>`: Device name to advertise (default: "nmidi-server")
-- `-p, --control-port <PORT>`: Starting control port - each MIDI port gets consecutive port pairs (default: 5004)
 - `-b, --bind <ADDR>`: Bind address (default: "0.0.0.0")
 - `--monitor-interval <SECONDS>`: Port monitoring interval in seconds (default: 5)
 - `-l, --log-level <LEVEL>`: Log level (trace, debug, info, warn, error)
@@ -67,11 +66,12 @@ The server will:
 1. Detect available MIDI input and output ports
 2. Monitor for port changes in the background
 3. **Advertise each MIDI port via separate mDNS entry** with service type `_apple-midi._udp`
-4. Allocate consecutive UDP port pairs for each MIDI port (control + data)
+4. Automatically allocate UDP port pairs for each MIDI port (OS-assigned)
 5. Listen for incoming connections on all advertised ports
 6. Handle AppleMIDI session handshakes and MIDI data transport
+7. Dynamically add/remove services as MIDI ports are connected/disconnected
 
-**Multi-Port Advertising**: Following Apple MIDI's approach, each physical MIDI port (input or output) is advertised as a separate mDNS service. This ensures maximum compatibility with Apple Audio MIDI Setup and other RTP-MIDI implementations. Each service includes TXT records with port metadata (name, type, index).
+**Multi-Port Advertising**: Following Apple MIDI's approach, each physical MIDI port (input or output) is advertised as a separate mDNS service. This ensures maximum compatibility with Apple Audio MIDI Setup and other RTP-MIDI implementations. Each service includes TXT records with port metadata (name, type, index). Services are automatically cleaned up when ports are disconnected.
 
 ### Client
 
