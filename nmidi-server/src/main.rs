@@ -42,10 +42,7 @@ impl Drop for MidiService {
         // Send shutdown signal to gracefully close sessions
         if let Some(tx) = self.shutdown_tx.take() {
             let _ = tx.send(());
-            // Give a brief moment for shutdown to be processed, then abort
-            // The task will be cleaned up when JoinHandle is dropped
         }
-        self.session_handle.abort();
     }
 }
 
@@ -103,71 +100,72 @@ async fn main() -> Result<()> {
         for port in current_ports.all_ports() {
             let port_key = format!("{}_{}", port.port_type.as_str(), port.index);
             
-            if !active_services.contains_key(&port_key) {
-                let service_name = format!("{}_{}", args.name, port_key);
-                
-                let mut properties = HashMap::new();
-                properties.insert("name".to_string(), port.name.clone());
-                properties.insert("ver".to_string(), "2".to_string());
-                properties.insert("type".to_string(), port.port_type.as_str().to_string());
-                properties.insert("index".to_string(), port.index.to_string());
-                
-                // Bind to port 0 to let OS assign available ports
-                let control_addr = format!("{}:0", args.bind);
-                let data_addr = format!("{}:0", args.bind);
-                
-                match session::SessionManager::new(
-                    service_name.clone(),
-                    control_addr,
-                    data_addr,
-                )
-                .await
-                {
-                    Ok(session_manager) => {
-                        let control_port = session_manager.control_port();
-                        
-                        match advertiser.advertise_service(
-                            &service_name,
-                            &args.name,
-                            control_port,
-                            properties,
-                        ) {
-                            Ok(service) => {
-                                info!(
-                                    "Advertising MIDI port '{}' ({} #{}) on port {}",
-                                    port.name, port.port_type.as_str(), port.index, control_port
-                                );
-                                
-                                // Create shutdown channel
-                                let (shutdown_tx, shutdown_rx) = oneshot::channel();
-                                
-                                // Spawn session handler
-                                let port_name = port.name.clone();
-                                let session_handle = tokio::spawn(async move {
-                                    if let Err(e) = session_manager.run(shutdown_rx).await {
-                                        warn!("Session manager error for port '{}': {}", port_name, e);
-                                    }
-                                });
-                                
-                                active_services.insert(
-                                    port_key,
-                                    MidiService {
-                                        _service: service,
-                                        shutdown_tx: Some(shutdown_tx),
-                                        session_handle,
-                                    },
-                                );
-                            }
-                            Err(e) => {
-                                warn!("Failed to advertise port '{}': {}", port.name, e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        warn!("Failed to create session manager for port '{}': {}", port.name, e);
-                    }
-                }
+            if active_services.contains_key(&port_key) {
+                continue;
             }
+            
+            let service_name = format!("{}_{}", args.name, port_key);
+            
+            let mut properties = HashMap::new();
+            properties.insert("name".to_string(), port.name.clone());
+            properties.insert("ver".to_string(), "2".to_string());
+            properties.insert("type".to_string(), port.port_type.as_str().to_string());
+            properties.insert("index".to_string(), port.index.to_string());
+            
+            // Create session manager with consecutive ports (Apple MIDI requirement)
+            let session_manager = match session::SessionManager::new(
+                service_name.clone(),
+                args.bind.clone(),
+            )
+            .await
+            {
+                Ok(sm) => sm,
+                Err(e) => {
+                    warn!("Failed to create session manager for port '{}': {}", port.name, e);
+                    continue;
+                }
+            };
+            
+            let control_port = session_manager.control_port();
+            let data_port = session_manager.data_port();
+            
+            let service = match advertiser.advertise_service(
+                &service_name,
+                &args.name,
+                control_port,
+                properties,
+            ) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to advertise port '{}': {}", port.name, e);
+                    continue;
+                }
+            };
+            
+            info!(
+                "Advertising MIDI port '{}' ({} #{}) on ports {}/{}",
+                port.name, port.port_type.as_str(), port.index, control_port, data_port
+            );
+            
+            // Create shutdown channel
+            let (shutdown_tx, shutdown_rx) = oneshot::channel();
+            
+            // Spawn session handler
+            let port_name = port.name.clone();
+            let session_handle = tokio::spawn(async move {
+                if let Err(e) = session_manager.run(shutdown_rx).await {
+                    warn!("Session manager error for port '{}': {}", port_name, e);
+                }
+            });
+            
+            active_services.insert(
+                port_key,
+                MidiService {
+                    _service: service,
+                    shutdown_tx: Some(shutdown_tx),
+                    session_handle,
+                },
+            );
         }
         
         if active_services.is_empty() {

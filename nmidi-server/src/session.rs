@@ -25,9 +25,9 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub async fn new(name: String, control_addr: String, data_addr: String) -> Result<Self> {
+    pub async fn new(name: String, bind_addr: String) -> Result<Self> {
         let ssrc = generate_ssrc();
-        let sockets = NetworkSockets::bind(&control_addr, &data_addr).await?;
+        let sockets = NetworkSockets::bind_consecutive(&bind_addr).await?;
         Ok(Self {
             name,
             ssrc,
@@ -39,6 +39,13 @@ impl SessionManager {
     /// Get the control port the session manager is bound to
     pub fn control_port(&self) -> u16 {
         self.sockets.control.local_addr()
+            .map(|addr| addr.port())
+            .unwrap_or(0)
+    }
+
+    /// Get the data port the session manager is bound to
+    pub fn data_port(&self) -> u16 {
+        self.sockets.data.local_addr()
             .map(|addr| addr.port())
             .unwrap_or(0)
     }
