@@ -155,9 +155,9 @@ impl SessionManager {
             // Priority queue (min-heap) for scheduled events
             let mut scheduled_events = BinaryHeap::new();
             
-            // Base timestamp for the scheduler - set when we receive first event
-            let mut base_instant: Option<Instant> = None;
-            let mut base_timestamp: u64 = 0;
+            // Base time for the scheduler - set when we receive first event
+            // Stored as (Instant, RTP timestamp) tuple to keep them synchronized
+            let mut base_time: Option<(Instant, u64)> = None;
             
             loop {
                 // Check if we have any events ready to execute
@@ -176,7 +176,7 @@ impl SessionManager {
                     }
                 } else {
                     // No scheduled events, wait indefinitely for new ones
-                    Duration::from_secs(3600) // 1 hour timeout as fallback
+                    Duration::from_secs(30) // 30 second timeout as fallback to check for new events
                 };
                 
                 // Wait for either a new event or timeout for scheduled event
@@ -189,21 +189,31 @@ impl SessionManager {
                                rtp_timestamp, midi_data);
                         
                         // Initialize base timestamp on first event
-                        if base_instant.is_none() {
-                            base_instant = Some(Instant::now());
-                            base_timestamp = rtp_timestamp;
-                            debug!("Initialized scheduler base: timestamp={}", base_timestamp);
+                        if base_time.is_none() {
+                            base_time = Some((Instant::now(), rtp_timestamp));
+                            debug!("Initialized scheduler base: timestamp={}", rtp_timestamp);
                         }
                         
                         // Calculate when to execute this event relative to base time
-                        let base = base_instant.unwrap();
-                        let delta_ticks = rtp_timestamp.wrapping_sub(base_timestamp);
+                        let (base_instant, base_timestamp) = base_time.unwrap();
+                        
+                        // Handle timestamp wraparound: if new timestamp is significantly smaller
+                        // than base, assume it wrapped around
+                        let delta_ticks = if rtp_timestamp < base_timestamp && 
+                                            base_timestamp.wrapping_sub(rtp_timestamp) > (u32::MAX as u64 / 2) {
+                            // Timestamp wrapped around, calculate correct delta
+                            let ticks_to_max = (u32::MAX as u64).wrapping_sub(base_timestamp);
+                            ticks_to_max.wrapping_add(rtp_timestamp).wrapping_add(1)
+                        } else {
+                            // Normal case: timestamp is ahead or within reasonable delta
+                            rtp_timestamp.wrapping_sub(base_timestamp)
+                        };
                         
                         // Convert RTP ticks (10kHz = 100us per tick) to microseconds
                         let delta_micros = (delta_ticks as u64) * 100;
                         
                         // Calculate absolute execution time
-                        let execute_at = base + Duration::from_micros(delta_micros);
+                        let execute_at = base_instant + Duration::from_micros(delta_micros);
                         
                         scheduled_events.push(ScheduledMidiEvent {
                             execute_at,
@@ -758,5 +768,42 @@ mod tests {
         
         let local_rtp_timestamp = local_micros / 100;
         assert_eq!(local_rtp_timestamp, 5100);
+    }
+
+    #[test]
+    fn test_timestamp_wraparound_detection() {
+        // Test wraparound detection logic
+        let base_timestamp: u64 = 4294967200; // Near u32::MAX
+        let new_timestamp: u64 = 100; // After wraparound
+        
+        // Check if this looks like a wraparound
+        let is_wraparound = new_timestamp < base_timestamp && 
+                           base_timestamp.wrapping_sub(new_timestamp) > (u32::MAX as u64 / 2);
+        assert!(is_wraparound);
+        
+        // Calculate correct delta for wraparound case
+        let ticks_to_max = (u32::MAX as u64).wrapping_sub(base_timestamp);
+        let delta_ticks = ticks_to_max.wrapping_add(new_timestamp).wrapping_add(1);
+        
+        // Should be: (u32::MAX - 4294967200) + 100 + 1 = 95 + 100 + 1 = 196
+        // u32::MAX = 4294967295
+        // ticks_to_max = 4294967295 - 4294967200 = 95
+        assert_eq!(delta_ticks, 196);
+    }
+
+    #[test]
+    fn test_normal_delta_calculation() {
+        // Test normal case where timestamp just increases
+        let base_timestamp: u64 = 1000;
+        let new_timestamp: u64 = 1500;
+        
+        // Should not be detected as wraparound
+        let is_wraparound = new_timestamp < base_timestamp && 
+                           base_timestamp.wrapping_sub(new_timestamp) > (u32::MAX as u64 / 2);
+        assert!(!is_wraparound);
+        
+        // Normal delta
+        let delta_ticks = new_timestamp.wrapping_sub(base_timestamp);
+        assert_eq!(delta_ticks, 500);
     }
 }
