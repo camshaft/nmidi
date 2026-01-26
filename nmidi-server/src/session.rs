@@ -2,7 +2,8 @@ use crate::midi::{MidiPortInfo, MidiPortType};
 use anyhow::Result;
 use midir::{MidiInput, MidiOutput};
 use nmidi_core::{
-    APPLEMIDI_SIGNATURE, APPLEMIDI_VERSION, AppleMidiPacket, RtpPacket,
+    APPLEMIDI_SIGNATURE, APPLEMIDI_VERSION, AppleMidiPacket, RtpPacket, SessionState,
+    create_sync_request, handle_synchronization,
     network::{MAX_UDP_PAYLOAD, NetworkSockets},
     util::{generate_ssrc, get_timestamp, micros_to_rtp_timestamp},
 };
@@ -39,24 +40,6 @@ impl PartialOrd for ScheduledMidiEvent {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
         Some(self.cmp(other))
     }
-}
-
-#[derive(Debug, Clone)]
-#[expect(dead_code)]
-struct SessionState {
-    ssrc: u32,
-    token: u32,
-    addr: SocketAddr,
-    data_addr: SocketAddr,
-    sequence: u16,
-    timestamp: u32,
-    /// Time offset in RTP ticks (10 kHz, 100us): peer_time = local_time + offset
-    /// Calculated from AppleMIDI synchronization packets
-    time_offset_ticks: i64,
-    /// Last synchronization count received from peer
-    last_sync_count: u8,
-    /// Last seen MIDI status byte for running status reconstruction
-    last_status: Option<u8>,
 }
 
 #[derive(Clone, Copy)]
@@ -645,15 +628,8 @@ impl SessionManager {
 
                 info!("Session established with {}", peer_name);
 
-                // Send initial synchronization
-                let now_ticks = micros_to_rtp_timestamp(get_timestamp()) as u64;
-                let sync = AppleMidiPacket::Synchronization {
-                    ssrc,
-                    count: 0,
-                    timestamp1: now_ticks,
-                    timestamp2: 0,
-                    timestamp3: 0,
-                };
+                // Send initial synchronization using shared function
+                let sync = create_sync_request(ssrc);
                 match send_on {
                     SendOn::Control => sockets.send_control(&sync, &addr).await?,
                     SendOn::Data => sockets.send_control_on_data(&sync, &addr).await?,
@@ -676,12 +652,9 @@ impl SessionManager {
                 count,
                 timestamp1,
                 timestamp2,
-                ..
+                timestamp3,
             } => {
                 info!("Received sync from SSRC {} (count {})", peer_ssrc, count);
-
-                // Get current time for response in RTP ticks (10 kHz)
-                let now_ticks = micros_to_rtp_timestamp(get_timestamp()) as u64;
 
                 // Ensure we have a session entry for this SSRC so we can track time offset
                 {
@@ -708,78 +681,33 @@ impl SessionManager {
                     });
                 }
 
-                // Update session with time synchronization info
-                if timestamp2 > 0 {
-                    // This is a response to our sync request (count is odd)
-                    // Calculate time offset: peer_time = local_time + offset
-                    // timestamp1 = peer's send time
-                    // timestamp2 = our receive time (from our original request)
-                    // timestamp3 = peer's response time
-                    // now = our current time
+                // Use shared synchronization handler
+                let sync_result = handle_synchronization(
+                    ssrc,
+                    peer_ssrc,
+                    count,
+                    timestamp1,
+                    timestamp2,
+                    timestamp3,
+                );
 
-                    // Round trip time
-                    let rtt = now_ticks.wrapping_sub(timestamp2);
-
-                    // Estimated one-way latency (half of RTT)
-                    let latency = rtt / 2;
-
-                    // Peer's time when we received this response
-                    let peer_time_estimate = timestamp1.wrapping_add(latency);
-
-                    // Calculate offset: how much to add to local time to get peer time
-                    // Compute signed offset in ticks; wrap-aware within u32 range
-                    let raw_diff = peer_time_estimate.wrapping_sub(now_ticks) as i64;
-                    let wrap = (u32::MAX as i64) + 1;
-                    let time_offset = if raw_diff > wrap / 2 {
-                        raw_diff - wrap
-                    } else if raw_diff < -wrap / 2 {
-                        raw_diff + wrap
-                    } else {
-                        raw_diff
-                    };
-
-                    debug!(
-                        "Sync from {}: offset={}, rtt={}, latency={}",
-                        peer_ssrc, time_offset, rtt, latency
-                    );
-
-                    // Update session state with synchronization info
+                // Update session state with calculated offset
+                if let Some(time_offset) = sync_result.time_offset_ticks {
                     let mut sessions_lock = sessions.lock().await;
                     if let Some(session) = sessions_lock.get_mut(&peer_ssrc) {
                         session.time_offset_ticks = time_offset;
                         session.last_sync_count = count;
                     }
                 } else {
-                    // This is an initial sync request (count is even, timestamp2 == 0)
-                    // Just store the count, we'll respond below
+                    // No offset calculated (initial request), just update count
                     let mut sessions_lock = sessions.lock().await;
                     if let Some(session) = sessions_lock.get_mut(&peer_ssrc) {
                         session.last_sync_count = count;
                     }
                 }
 
-                // Respond per spec: when receiving count 0, set count=1 and stamp
-                // timestamp2 to our receive time; when receiving count 1, set count=2
-                // and stamp timestamp3 to our send time. Ignore higher counts.
-                let maybe_response = match count {
-                    0 => Some(AppleMidiPacket::Synchronization {
-                        ssrc,
-                        count: 1,
-                        timestamp1,
-                        timestamp2: now_ticks,
-                        timestamp3: now_ticks,
-                    }),
-                    1 => Some(AppleMidiPacket::Synchronization {
-                        ssrc,
-                        count: 2,
-                        timestamp1,
-                        timestamp2,
-                        timestamp3: now_ticks,
-                    }),
-                    _ => None,
-                };
-
-                if let Some(response) = maybe_response {
+                // Send response if needed
+                if let Some(response) = sync_result.response {
                     match send_on {
                         SendOn::Control => sockets.send_control(&response, &addr).await?,
                         SendOn::Data => sockets.send_control_on_data(&response, &addr).await?,
