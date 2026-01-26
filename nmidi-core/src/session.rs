@@ -40,13 +40,16 @@ pub struct SyncResult {
 /// - The simpler approach matches the reference implementation and avoids potential
 ///   issues with asymmetric delays
 /// 
+/// Note: timestamp3 must still be included in the function signature to match the
+/// AppleMIDI protocol packet structure, but it's not used in the calculation.
+/// 
 /// # Arguments
 /// * `ssrc` - Local SSRC
 /// * `peer_ssrc` - Peer SSRC
 /// * `count` - Sync count from packet
 /// * `timestamp1` - Peer's send time
 /// * `timestamp2` - Our original send time (from our request)
-/// * `_timestamp3` - Peer's response time (not used in simplified calculation)
+/// * `_timestamp3` - Peer's response time (present in protocol but unused in calculation)
 /// 
 /// Returns SyncResult with optional response packet and time offset
 pub fn handle_synchronization(

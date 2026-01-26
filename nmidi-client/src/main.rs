@@ -451,6 +451,8 @@ fn spawn_virtual_output_task(
                     let local_ticks = micros_to_rtp_timestamp(current_micros) as i64;
                     
                     // Apply time offset: peer_time = local_time + offset
+                    // wrapping_add handles both positive and negative offsets correctly
+                    // (negative offset is represented as large positive i64 in two's complement)
                     let time_offset = session_state.lock().await.time_offset_ticks;
                     let peer_ticks = local_ticks.wrapping_add(time_offset);
                     // Cast to u32 with wrapping (RTP timestamps are u32 and wrap naturally)
@@ -542,7 +544,7 @@ fn spawn_virtual_input_task(
                                     // Apply time offset to convert from peer time to local time
                                     // peer_time = local_time + offset
                                     // Therefore: local_time = peer_time - offset
-                                    let time_offset_micros = time_offset_ticks * 100;
+                                    let time_offset_micros = time_offset_ticks.saturating_mul(100);
                                     let base_local_micros = if time_offset_micros >= 0 {
                                         rtp_timestamp_micros.saturating_sub(time_offset_micros as u64)
                                     } else {
@@ -577,7 +579,10 @@ fn spawn_virtual_input_task(
                                         
                                         // Schedule for future or execute immediately
                                         if execute_micros > now_micros {
-                                            let delay = Duration::from_micros(execute_micros - now_micros);
+                                            let delay_micros = execute_micros.saturating_sub(now_micros);
+                                            // Cap delay at reasonable maximum (10 seconds) to avoid overflow
+                                            let delay_micros = delay_micros.min(10_000_000);
+                                            let delay = Duration::from_micros(delay_micros);
                                             let execute_at = Instant::now() + delay;
                                             event_queue.push(ScheduledMidiEvent {
                                                 execute_at,
