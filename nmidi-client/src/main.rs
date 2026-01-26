@@ -451,15 +451,14 @@ fn spawn_virtual_output_task(
                     let local_ticks = micros_to_rtp_timestamp(current_micros) as i64;
                     
                     // Apply time offset: peer_time = local_time + offset
-                    // wrapping_add handles both positive and negative offsets correctly
-                    // (negative offset is represented as large positive i64 in two's complement)
+                    // Works correctly for both positive and negative offsets in two's complement
                     let time_offset = session_state.lock().await.time_offset_ticks;
                     let peer_ticks = local_ticks.wrapping_add(time_offset);
-                    // Cast to u32 with wrapping (RTP timestamps are u32 and wrap naturally)
-                    let rtp_timestamp = (peer_ticks as u64 & 0xFFFFFFFF) as u32;
+                    // Cast to u32 (truncates to lower 32 bits, matching RTP protocol)
+                    let rtp_timestamp = peer_ticks as u32;
                     
-                    debug!("Sending MIDI with local_ticks={}, offset={}, peer_ticks={}", 
-                           local_ticks, time_offset, peer_ticks);
+                    debug!("Sending MIDI with local_ticks={}, offset={}, peer_ticks={}, rtp_ts={}", 
+                           local_ticks, time_offset, peer_ticks, rtp_timestamp);
                     
                     // Create RTP packet
                     let mut packet = RtpPacket::new(ssrc, sequence, rtp_timestamp);
@@ -580,7 +579,8 @@ fn spawn_virtual_input_task(
                                         // Schedule for future or execute immediately
                                         if execute_micros > now_micros {
                                             let delay_micros = execute_micros.saturating_sub(now_micros);
-                                            // Cap delay at reasonable maximum (10 seconds) to avoid overflow
+                                            // Cap delay at 10 seconds as practical scheduling limit
+                                            // (events further in future likely indicate clock sync issues)
                                             let delay_micros = delay_micros.min(10_000_000);
                                             let delay = Duration::from_micros(delay_micros);
                                             let execute_at = Instant::now() + delay;
