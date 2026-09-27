@@ -1,6 +1,7 @@
 /target
 **/*.rs.bk
 *.pdb
-Cargo.lock
 /tmp
 *.log
+result
+result-*
