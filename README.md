@@ -9,6 +9,25 @@ MIDI Over Network Daemon - RTP-MIDI implementation with client and server
 - **nmidi-core**: Core library implementing AppleMIDI session management, RTP-MIDI packet encoding/decoding, network sockets, and mDNS discovery
 - **nmidi-server**: Network MIDI server that exposes local MIDI ports over the network
 - **nmidi-client**: Network MIDI client that connects to remote MIDI services
+- **nmidid**: MIDI data-plane daemon that owns the RTP-MIDI data plane behind the `capmesh-ctl` control socket (driven by capmeshd — see `capmeshd/docs/CONTROL-PROTOCOL.md`)
+
+### nmidid — the control-socket daemon
+
+`nmidid` exposes the local MIDI plane over a Unix domain socket carrying
+newline-delimited JSON-RPC 2.0. It is the first daemon speaking `capmesh-ctl`;
+capmeshd (the control plane) is the client. Currently implemented: the socket
+framing plus `hello`, `list-ports`, and `describe-port`; `mount`/`unmount` and
+hot-plug notifications land in later increments.
+
+```bash
+# Run the daemon (default socket /run/nmidid.sock; pick a writable path for a dev run)
+nmidid --socket /tmp/nmidid.sock --log-level info
+
+# Handshake + enumerate local ports (NDJSON, one JSON-RPC value per line):
+printf '%s\n%s\n' \
+  '{"jsonrpc":"2.0","id":1,"method":"hello","params":{"protocol":"1","client":"cli/0.1"}}' \
+  '{"jsonrpc":"2.0","id":2,"method":"list-ports","params":{}}' | nc -U /tmp/nmidid.sock
+```
 
 This implementation follows the specifications in:
 - RFC 6295: RTP Payload Format for MIDI
